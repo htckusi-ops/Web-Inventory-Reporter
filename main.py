@@ -452,26 +452,12 @@ def write_excel(data):
     ws_sum.column_dimensions["D"].width = 28
     ws_sum.column_dimensions["E"].width = 18
 
-    # Embed thumbnail icon if available
-    thumb_asset = ASSETS_DIR / "thumbnail.png"
-    if thumb_asset.exists():
-        try:
-            xl_icon = XLImage(str(thumb_asset))
-            xl_icon.width, xl_icon.height = 48, 48
-            ws_sum.add_image(xl_icon, "B2")
-            ws_sum.row_dimensions[2].height = 40
-            ws_sum.row_dimensions[3].height = 18
-            ws_sum.row_dimensions[4].height = 14
-            title_row = 2
-        except Exception:
-            title_row = 2
-    # Title text always written (icon sits above/beside in same cell region)
-    ws_sum["D2"] = _t["main_title"]
-    ws_sum["D2"].font = title_font
-    ws_sum["D3"] = f"Erstellt: {ts}"
-    ws_sum["D3"].font = subtitle_font
-    ws_sum["D4"] = f"{_a['name']} · {_a['email']}"
-    ws_sum["D4"].font = Font(name="Arial", size=9, color="6c757d")
+    ws_sum["B2"] = _t["main_title"]
+    ws_sum["B2"].font = title_font
+    ws_sum["B3"] = f"Erstellt: {ts}"
+    ws_sum["B3"].font = subtitle_font
+    ws_sum["B4"] = f"{_a['name']} · {_a['email']}"
+    ws_sum["B4"].font = Font(name="Arial", size=9, color="6c757d")
 
     r = 6
     stats = [
@@ -696,9 +682,9 @@ def write_html(data):
     load_times = [float(d["load_time"]) for d in data if d.get("load_time")]
     avg_load = sum(load_times) / len(load_times) if load_times else 0
 
-    # Banner image
-    banner_asset = ASSETS_DIR / "banner.png"
-    banner_b64   = image_to_base64(str(banner_asset)) if banner_asset.exists() else ""
+    # Thumbnail for header (assets/thumbnail.png)
+    thumb_asset = ASSETS_DIR / "thumbnail.png"
+    thumb_b64   = image_to_base64(str(thumb_asset)) if thumb_asset.exists() else ""
 
     # Build JSON data array for client-side pagination/search/sort
     json_data = []
@@ -723,7 +709,7 @@ def write_html(data):
             "delta":     row.get("delta", ""),
         })
 
-    data_json = json.dumps(json_data, ensure_ascii=False)
+    data_json = json.dumps(json_data, ensure_ascii=False).replace('</', '<\\/')
 
     html = f"""<!DOCTYPE html>
 <html lang="de">
@@ -851,7 +837,10 @@ tbody td {{ padding:0.45rem 0.7rem; vertical-align:middle; border-bottom:1px sol
 <body>
 
 <div class="header">
-    {'<img src="' + banner_b64 + '" alt="Banner" style="height:56px;border-radius:6px;" />' if banner_b64 else '<div><h1>' + _t['main_title'] + '</h1><div class="sub">' + _t['subtitle'] + '</div></div>'}
+    <div style="display:flex;align-items:center;gap:1rem;">
+        {'<img src="' + thumb_b64 + '" alt="Thumbnail" style="height:56px;border-radius:6px;flex-shrink:0;" />' if thumb_b64 else ''}
+        <div><h1>{_t['main_title']}</h1><div class="sub">{_t['subtitle']}</div></div>
+    </div>
     <div class="header-meta">Erstellt: {ts}<br>Hosts: {total}</div>
 </div>
 
