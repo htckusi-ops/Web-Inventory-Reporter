@@ -1011,7 +1011,7 @@ function render() {{
     const cls=i%2===0?'row-even':'row-odd';
     const img=r.thumb?`<img src="${{r.thumb}}" class="table-thumb">`:'<span class="no-img">—</span>';
     const err=r.error?`<span class="err-text">${{esc(r.error.substring(0,80))}}</span>`:'—';
-    const chain=(r.redirect_chain||[]).join('\n');
+    const chain=(r.redirect_chain||[]).join('\\n');
     return `<tr class="${{cls}}">
       <td>${{img}}</td>
       <td class="cell-host">${{esc(r.host)}}</td>
