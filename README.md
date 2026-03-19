@@ -1,6 +1,6 @@
 # Web Inventory Reporter
 
-Scannt eine Liste von Domains, erstellt Screenshots und generiert professionelle Reports im SRG SSR Corporate Design.
+Scannt eine Liste von Domains, erstellt Screenshots und generiert professionelle Reports (HTML, Excel, CSV).
 
 ## Setup
 
@@ -9,19 +9,47 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-## Run
+## Konfiguration
+
+Alle Einstellungen werden in `config.ini` vorgenommen:
+
+```ini
+[general]
+domains_file = domains.txt      # Standard-Domainliste
+
+[author]
+name  = Your Name
+email = your@email.com
+
+[titles]
+main_title       = Your Name – Web Inventory Report
+subtitle         = Automatisierte Website-Übersicht
+sheet_inventory  = Web Inventory
+sheet_summary    = Zusammenfassung
+
+[colors]
+primary  = af001d   # Akzentfarbe (Hex, ohne #)
+dark     = 333333
+white    = ffffff
+light_bg = f5f5f5
+border   = dee2e6
+```
+
+## Verwendung
 
 ```bash
-python main.py domains.txt
+# Domainliste aus config.ini verwenden
+python main.py
+
+# Eigene Domainliste übergeben
+python main.py my_domains.txt
 ```
 
-Die Datei `domains.txt` enthält pro Zeile einen Hostnamen (Kommentare mit `#`):
+Die Domainliste enthält pro Zeile einen Hostnamen (Kommentare mit `#`):
 
 ```
-srgssr.ch
-srf.ch
-rts.ch
-rsi.ch
+example.com
+example.org
 ```
 
 ## Output
@@ -32,7 +60,7 @@ rsi.ch
 | `output/report.xlsx` | Formatierter Excel-Report mit Thumbnails |
 | `output/report.csv` | Rohdaten |
 | `output/screenshots/` | Vollständige Screenshots (PNG, 1280×800 Viewport) |
-| `output/thumbnails/` | 16:10 Thumbnails (480×300px) |
+| `output/thumbnails/` | 16:10 Thumbnails (320×200px) |
 | `output/logs/scan.log` | Scan-Protokoll |
 
 ## Features
@@ -46,26 +74,17 @@ rsi.ch
 - Screenshot + 16:10 Thumbnail
 
 ### HTML Report
-- SRG SSR Branding (`#af001d` Rot, `#333333` Grau)
 - Umschaltbar zwischen Karten-Grid und Tabelle
 - Base64-eingebettete Bilder (portabel, eine Datei)
 - Zusammenfassungs-Statistiken im Header
 - Responsive Layout
 
 ### Excel Report
-- Header im SRG-Rot mit weisser Schrift
+- Farbiger Header, konfigurierbar via `config.ini`
 - Zebra-Streifen, korrekt verankerte Thumbnails
 - Eingefrorene Kopfzeile, Autofilter
 - Status-Farbcodierung
+- Zusammenfassung mit Top-10 langsamsten Hosts und SSL-Ablaufdaten
 
 ### CSV
 - Saubere Rohdaten ohne Bild-Pfade
-
-## Farbschema
-
-Aus dem offiziellen SRG SSR Design Guidelines Manual:
-
-| Farbe | Hex | RGB |
-|---|---|---|
-| SRG Rot | `#af001d` | 175, 0, 30 |
-| SRG Grau | `#333333` | 51, 51, 51 |
