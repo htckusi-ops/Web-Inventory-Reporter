@@ -7,6 +7,8 @@ import json
 import time
 import ssl
 import socket
+import queue
+import threading
 from pathlib import Path
 from datetime import datetime
 from playwright.sync_api import sync_playwright
@@ -19,11 +21,14 @@ from PIL import Image
 
 CONFIG_FILE = "config.ini"
 
-OUTPUT_DIR = Path("output")
+ASSETS_DIR     = Path("assets")
+OUTPUT_DIR     = Path("output")
 SCREENSHOT_DIR = OUTPUT_DIR / "screenshots"
-THUMB_DIR = OUTPUT_DIR / "thumbnails"
-LOG_FILE = OUTPUT_DIR / "logs" / "scan.log"
+THUMB_DIR      = OUTPUT_DIR / "thumbnails"
+LOG_FILE       = OUTPUT_DIR / "logs" / "scan.log"
+LAST_SCAN_FILE = OUTPUT_DIR / "last_scan.json"
 
+ASSETS_DIR.mkdir(exist_ok=True)
 SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 THUMB_DIR.mkdir(parents=True, exist_ok=True)
 (LOG_FILE.parent).mkdir(parents=True, exist_ok=True)
@@ -47,6 +52,12 @@ def load_config() -> configparser.ConfigParser:
             "light_bg": "f5f5f5",
             "border":   "dee2e6",
         },
+        "scan": {
+            "workers":       "4",
+            "goto_timeout":  "15000",
+            "page_timeout":  "30000",
+            "ssl_timeout":   "5",
+        },
     })
     cfg.read(CONFIG_FILE, encoding="utf-8")
     return cfg
@@ -54,15 +65,68 @@ def load_config() -> configparser.ConfigParser:
 
 CFG = load_config()
 _c = CFG["colors"]
-SRG_RED     = _c["primary"]
-SRG_GRAY    = _c["dark"]
-SRG_WHITE   = _c["white"]
+SRG_RED      = _c["primary"]
+SRG_GRAY     = _c["dark"]
+SRG_WHITE    = _c["white"]
 SRG_LIGHT_BG = _c["light_bg"]
-SRG_BORDER  = _c["border"]
+SRG_BORDER   = _c["border"]
 
-# Thumbnail: fixed 16:10, smaller for 600+ hosts
-THUMB_WIDTH = 320
+_s = CFG["scan"]
+WORKERS      = int(_s["workers"])
+GOTO_TIMEOUT = int(_s["goto_timeout"])
+PAGE_TIMEOUT = int(_s["page_timeout"])
+SSL_TIMEOUT  = int(_s["ssl_timeout"])
+
+THUMB_WIDTH  = 320
 THUMB_HEIGHT = 200
+
+# ── Security headers ──────────────────────────────────────────────────────────
+SEC_HEADERS = [
+    "strict-transport-security",
+    "content-security-policy",
+    "x-frame-options",
+    "x-content-type-options",
+    "x-xss-protection",
+    "referrer-policy",
+    "permissions-policy",
+]
+
+# ── CMS detection signatures ──────────────────────────────────────────────────
+_CMS_SIGS = [
+    ("WordPress",   [r"wp-content/", r"wp-includes/", r'name="generator"[^>]*WordPress', r"wp-json"]),
+    ("Joomla",      [r"/media/jui/", r'name="generator"[^>]*Joomla', r"joomla_user_state"]),
+    ("Drupal",      [r"/sites/default/files/", r'name="generator"[^>]*Drupal', r"Drupal\.settings"]),
+    ("TYPO3",       [r"/typo3/", r'name="generator"[^>]*TYPO3', r"typo3conf"]),
+    ("Shopify",     [r"cdn\.shopify\.com", r"myshopify\.com"]),
+    ("Wix",         [r"wixsite\.com", r"wix-static\.net"]),
+    ("Squarespace", [r"static\.squarespace\.com"]),
+    ("Webflow",     [r"webflow\.io", r'data-wf-page']),
+    ("Contao",      [r'name="generator"[^>]*Contao']),
+    ("NEOS",        [r'name="generator"[^>]*Neos']),
+    ("Magento",     [r"Mage\.Cookies", r"/skin/frontend/"]),
+    ("PrestaShop",  [r"prestashop", r"/themes/.*?/css/global\.css"]),
+    ("Ghost",       [r'name="generator"[^>]*Ghost', r"/ghost/"]),
+    ("HubSpot",     [r"hs-scripts\.com", r"hubspot\.com/hs-fs"]),
+]
+
+
+def detect_cms(html: str, headers: dict) -> str:
+    gen     = headers.get("x-generator", "").lower()
+    powered = headers.get("x-powered-by", "").lower()
+    for name, _ in _CMS_SIGS:
+        if name.lower() in gen or name.lower() in powered:
+            return name
+    for name, patterns in _CMS_SIGS:
+        for pat in patterns:
+            if re.search(pat, html, re.IGNORECASE):
+                return name
+    return ""
+
+
+def check_security_headers(headers: dict) -> dict:
+    result = {h: headers.get(h, "") for h in SEC_HEADERS}
+    result["_score"] = sum(1 for h in SEC_HEADERS if headers.get(h))
+    return result
 
 
 def log(msg):
@@ -113,7 +177,7 @@ def get_ssl_info(host):
     try:
         ctx = ssl.create_default_context()
         with ctx.wrap_socket(socket.socket(), server_hostname=host) as s:
-            s.settimeout(5)
+            s.settimeout(SSL_TIMEOUT)
             s.connect((host, 443))
             cert = s.getpeercertificate()
             expiry = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
@@ -129,7 +193,7 @@ def get_ssl_info_insecure(host):
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_OPTIONAL
         with ctx.wrap_socket(socket.socket(), server_hostname=host) as s:
-            s.settimeout(5)
+            s.settimeout(SSL_TIMEOUT)
             s.connect((host, 443))
             cert = s.getpeercertificate()
             if cert and "notAfter" in cert:
@@ -154,25 +218,56 @@ def _is_ignorable_error(msg: str) -> bool:
 
 
 def _do_scan(page, url, host):
-    """Perform a single goto + screenshot, return result dict."""
-    start = time.time()
-    response = page.goto(url, timeout=15000)
-    load_time = round(time.time() - start, 2)
-    final_url = page.url
-    title = page.title()
-    filename = sanitize(host)
-    screenshot_path = SCREENSHOT_DIR / f"{filename}.png"
-    thumb_path = THUMB_DIR / f"{filename}.jpg"
-    page.screenshot(path=str(screenshot_path), full_page=False)
-    create_thumbnail_16_10(screenshot_path, thumb_path)
-    return {
-        "status": response.status if response else "",
-        "final_url": final_url,
-        "title": title,
-        "load_time": load_time,
-        "screenshot": str(screenshot_path),
-        "thumbnail": str(thumb_path),
-    }
+    """Perform goto + screenshot + security headers + redirect chain + CMS."""
+    redirect_chain = []
+
+    def on_response(resp):
+        if resp.status in (301, 302, 303, 307, 308):
+            redirect_chain.append({
+                "url":      resp.url,
+                "status":   resp.status,
+                "location": resp.headers.get("location", ""),
+            })
+
+    page.on("response", on_response)
+    try:
+        start = time.time()
+        response = page.goto(url, timeout=GOTO_TIMEOUT, wait_until="domcontentloaded")
+        load_time = round(time.time() - start, 2)
+        final_url = page.url
+        title     = page.title()
+        filename  = sanitize(host)
+
+        screenshot_path = SCREENSHOT_DIR / f"{filename}.png"
+        thumb_path      = THUMB_DIR      / f"{filename}.jpg"
+        page.screenshot(path=str(screenshot_path), full_page=False)
+        create_thumbnail_16_10(screenshot_path, thumb_path)
+
+        resp_headers = {}
+        if response:
+            resp_headers = {k.lower(): v for k, v in response.headers.items()}
+
+        sec_headers = check_security_headers(resp_headers)
+
+        try:
+            html_content = page.content()
+        except Exception:
+            html_content = ""
+        cms = detect_cms(html_content, resp_headers)
+
+        return {
+            "status":           response.status if response else "",
+            "final_url":        final_url,
+            "title":            title,
+            "load_time":        load_time,
+            "screenshot":       str(screenshot_path),
+            "thumbnail":        str(thumb_path),
+            "security_headers": sec_headers,
+            "redirect_chain":   redirect_chain,
+            "cms":              cms,
+        }
+    finally:
+        page.remove_listener("response", on_response)
 
 
 def scan_host(page, browser, host):
@@ -217,19 +312,79 @@ def scan_host(page, browser, host):
 
     return {
         "host": host, "status": "", "final_url": "", "title": "",
-        "load_time": "", "ssl_expiry": "", "screenshot": "",
-        "thumbnail": "", "error": last_error,
+        "load_time": "", "ssl_expiry": "", "screenshot": "", "thumbnail": "",
+        "security_headers": {"_score": 0}, "redirect_chain": [], "cms": "",
+        "error": last_error,
     }
+
+
+# ── Delta Report ─────────────────────────────────────────────────────────────
+
+def load_previous_results() -> dict:
+    if not LAST_SCAN_FILE.exists():
+        return {}
+    try:
+        with open(LAST_SCAN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {r["host"]: r for r in data if r}
+    except Exception:
+        return {}
+
+
+def save_results_json(data: list):
+    with open(LAST_SCAN_FILE, "w", encoding="utf-8") as f:
+        json.dump([r for r in data if r], f, ensure_ascii=False, default=str)
+
+
+def compute_delta(result: dict, previous: dict) -> str:
+    host = result["host"]
+    if host not in previous:
+        return "new"
+    prev = previous[host]
+    if (str(result.get("status", "")) != str(prev.get("status", "")) or
+            result.get("title", "")     != prev.get("title", "")     or
+            result.get("final_url", "") != prev.get("final_url", "")):
+        return "changed"
+    return "unchanged"
 
 
 # ── CSV ──────────────────────────────────────────────────────────────────────
 
+def _redirect_chain_str(chain: list) -> str:
+    if not chain:
+        return ""
+    return " → ".join(f'{r["url"]} ({r["status"]})' for r in chain)
+
+
+def _sec_score(row: dict) -> int:
+    return row.get("security_headers", {}).get("_score", 0)
+
+
 def write_csv(data):
-    fieldnames = ["host", "status", "final_url", "title", "load_time", "ssl_expiry", "error"]
+    fieldnames = [
+        "host", "status", "final_url", "title", "load_time", "ssl_expiry",
+        "cms", "sec_score", "redirects", "redirect_chain", "delta", "error",
+    ]
+    rows = []
+    for r in data:
+        rows.append({
+            "host":           r["host"],
+            "status":         r.get("status", ""),
+            "final_url":      r.get("final_url", ""),
+            "title":          r.get("title", ""),
+            "load_time":      r.get("load_time", ""),
+            "ssl_expiry":     r.get("ssl_expiry", ""),
+            "cms":            r.get("cms", ""),
+            "sec_score":      _sec_score(r),
+            "redirects":      len(r.get("redirect_chain", [])),
+            "redirect_chain": _redirect_chain_str(r.get("redirect_chain", [])),
+            "delta":          r.get("delta", ""),
+            "error":          r.get("error", ""),
+        })
     with open(OUTPUT_DIR / "report.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(data)
+        writer.writerows(rows)
     log("CSV report written.")
 
 
@@ -297,12 +452,26 @@ def write_excel(data):
     ws_sum.column_dimensions["D"].width = 28
     ws_sum.column_dimensions["E"].width = 18
 
-    ws_sum["B2"] = _t["main_title"]
-    ws_sum["B2"].font = title_font
-    ws_sum["B3"] = f"Erstellt: {ts}"
-    ws_sum["B3"].font = subtitle_font
-    ws_sum["B4"] = f"{_a['name']} · {_a['email']}"
-    ws_sum["B4"].font = Font(name="Arial", size=9, color="6c757d")
+    # Embed thumbnail icon if available
+    thumb_asset = ASSETS_DIR / "thumbnail.png"
+    if thumb_asset.exists():
+        try:
+            xl_icon = XLImage(str(thumb_asset))
+            xl_icon.width, xl_icon.height = 48, 48
+            ws_sum.add_image(xl_icon, "B2")
+            ws_sum.row_dimensions[2].height = 40
+            ws_sum.row_dimensions[3].height = 18
+            ws_sum.row_dimensions[4].height = 14
+            title_row = 2
+        except Exception:
+            title_row = 2
+    # Title text always written (icon sits above/beside in same cell region)
+    ws_sum["D2"] = _t["main_title"]
+    ws_sum["D2"].font = title_font
+    ws_sum["D3"] = f"Erstellt: {ts}"
+    ws_sum["D3"].font = subtitle_font
+    ws_sum["D4"] = f"{_a['name']} · {_a['email']}"
+    ws_sum["D4"].font = Font(name="Arial", size=9, color="6c757d")
 
     r = 6
     stats = [
@@ -415,8 +584,11 @@ def write_excel(data):
     # ═══════════════════════════════════════════════════════════════════════
     ws = wb.create_sheet(_t["sheet_inventory"])
 
-    headers = ["Host", "Status", "Ladezeit (s)", "SSL gültig bis", "Final URL", "Titel", "Fehler", "Preview"]
-    col_widths = [28, 10, 14, 16, 45, 35, 35, 30]
+    # Col: Host Status Ladezeit SSL-bis CMS Sec Redirects FinalURL Titel Delta Fehler Preview
+    headers    = ["Host", "Status", "Ladezeit (s)", "SSL gültig bis",
+                  "CMS", "Sec.", "Redirects", "Final URL", "Titel", "Delta", "Fehler", "Preview"]
+    col_widths = [28,     10,      14,           16,
+                  14,     8,       12,           40,         30,     10,     30,        28    ]
 
     for j, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=j, value=h)
@@ -429,25 +601,43 @@ def write_excel(data):
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(data)+1}"
 
+    _delta_colors = {"new": "198754", "changed": "856404", "unchanged": SRG_GRAY}
+    _preview_col  = len(headers)  # last column = Preview
+
     for i, row in enumerate(data, start=2):
-        fill = zebra if i % 2 == 0 else white
-        vals = [row["host"], row["status"], row["load_time"], row["ssl_expiry"],
-                row["final_url"], row["title"], row["error"], ""]
+        fill     = zebra if i % 2 == 0 else white
+        sec_val  = f'{_sec_score(row)}/7'
+        redir_val = _redirect_chain_str(row.get("redirect_chain", []))[:60] or "—"
+        delta_val = row.get("delta", "")
+
+        vals = [
+            row["host"], row.get("status", ""), row.get("load_time", ""), row.get("ssl_expiry", ""),
+            row.get("cms", "") or "—", sec_val, redir_val,
+            row.get("final_url", ""), row.get("title", ""), delta_val,
+            row.get("error", ""), "",
+        ]
 
         for j, val in enumerate(vals, 1):
             c = ws.cell(row=i, column=j, value=val)
             c.font, c.fill, c.border = cell_font, fill, border
-            c.alignment = center_align if j in (2, 3, 4) else cell_align
+            c.alignment = center_align if j in (2, 3, 4, 6, 7, 10) else cell_align
 
             if j == 2 and val:
                 s = int(val) if str(val).isdigit() else 0
                 c.font = font_ok if 200 <= s < 300 else (font_redir if 300 <= s < 400 else font_err)
+            elif j == 6:  # Sec score
+                score = _sec_score(row)
+                c.font = Font(name="Arial", size=10, bold=True,
+                              color="198754" if score >= 6 else ("856404" if score >= 4 else SRG_RED))
+            elif j == 10 and val:  # Delta
+                col = _delta_colors.get(val, SRG_GRAY)
+                c.font = Font(name="Arial", size=10, bold=True, color=col)
 
-        if row["thumbnail"] and Path(row["thumbnail"]).exists():
+        if row.get("thumbnail") and Path(row["thumbnail"]).exists():
             try:
                 img = XLImage(row["thumbnail"])
                 img.width, img.height = 160, 100
-                ws.add_image(img, f"H{i}")
+                ws.add_image(img, f"{get_column_letter(_preview_col)}{i}")
             except Exception as e:
                 log(f"Excel image error for {row['host']}: {e}")
 
@@ -506,19 +696,31 @@ def write_html(data):
     load_times = [float(d["load_time"]) for d in data if d.get("load_time")]
     avg_load = sum(load_times) / len(load_times) if load_times else 0
 
+    # Banner image
+    banner_asset = ASSETS_DIR / "banner.png"
+    banner_b64   = image_to_base64(str(banner_asset)) if banner_asset.exists() else ""
+
     # Build JSON data array for client-side pagination/search/sort
     json_data = []
     for row in data:
-        b64 = image_to_base64(row["thumbnail"]) if row["thumbnail"] else ""
+        b64   = image_to_base64(row["thumbnail"]) if row.get("thumbnail") else ""
+        chain = row.get("redirect_chain", [])
+        sh    = row.get("security_headers", {})
         json_data.append({
-            "host": row["host"],
-            "status": str(row["status"]),
-            "final_url": row["final_url"],
-            "title": row["title"],
-            "load_time": row["load_time"] if row["load_time"] else None,
-            "ssl_expiry": row["ssl_expiry"],
-            "thumb": b64,
-            "error": row["error"],
+            "host":      row["host"],
+            "status":    str(row.get("status", "")),
+            "final_url": row.get("final_url", ""),
+            "title":     row.get("title", ""),
+            "load_time": row["load_time"] if row.get("load_time") else None,
+            "ssl_expiry": row.get("ssl_expiry", ""),
+            "thumb":     b64,
+            "error":     row.get("error", ""),
+            "cms":       row.get("cms", ""),
+            "sec_score": sh.get("_score", 0),
+            "sec_detail": {k: bool(v) for k, v in sh.items() if k != "_score"},
+            "redirect_count": len(chain),
+            "redirect_chain": [f'{r["url"]} ({r["status"]})' for r in chain],
+            "delta":     row.get("delta", ""),
         })
 
     data_json = json.dumps(json_data, ensure_ascii=False)
@@ -591,6 +793,19 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,
 .badge-client-err {{ background:#fde8e8; color:var(--srg-red); }}
 .badge-server-err {{ background:#fde8e8; color:#8b0000; }}
 .badge-unknown {{ background:#edf2f7; color:var(--srg-gray-light); }}
+.badge-cms {{ background:#e8f0fe; color:#1a56db; }}
+.badge-new {{ background:var(--srg-green-bg); color:var(--srg-green); }}
+.badge-changed {{ background:var(--srg-yellow-bg); color:var(--srg-yellow); }}
+.sec-score {{ display:inline-flex; align-items:center; gap:2px; font-size:0.72rem; font-weight:700; }}
+.sec-high {{ color:var(--srg-green); }}
+.sec-mid {{ color:var(--srg-yellow); }}
+.sec-low {{ color:var(--srg-red); }}
+.card-sec {{ font-size:0.7rem; }}
+.redir-chip {{ font-size:0.7rem; color:#6c757d; cursor:help; }}
+.sec-tooltip {{ position:relative; cursor:help; }}
+.sec-tooltip:hover .sec-tip {{ display:block; }}
+.sec-tip {{ display:none; position:absolute; z-index:99; bottom:120%; left:50%; transform:translateX(-50%); background:#333; color:#fff; font-size:0.7rem; padding:0.4rem 0.6rem; border-radius:4px; white-space:nowrap; min-width:180px; line-height:1.6; }}
+.sec-tip::after {{ content:""; position:absolute; top:100%; left:50%; transform:translateX(-50%); border:5px solid transparent; border-top-color:#333; }}
 
 .lt {{ font-size:0.72rem; font-weight:500; }}
 .lt-fast {{ color:var(--srg-green); }}
@@ -636,7 +851,7 @@ tbody td {{ padding:0.45rem 0.7rem; vertical-align:middle; border-bottom:1px sol
 <body>
 
 <div class="header">
-    <div><h1>{_t['main_title']}</h1><div class="sub">{_t['subtitle']}</div></div>
+    {'<img src="' + banner_b64 + '" alt="Banner" style="height:56px;border-radius:6px;" />' if banner_b64 else '<div><h1>' + _t['main_title'] + '</h1><div class="sub">' + _t['subtitle'] + '</div></div>'}
     <div class="header-meta">Erstellt: {ts}<br>Hosts: {total}</div>
 </div>
 
@@ -651,7 +866,7 @@ tbody td {{ padding:0.45rem 0.7rem; vertical-align:middle; border-bottom:1px sol
 <div class="toolbar">
     <button class="active" onclick="setView('cards')">Karten</button>
     <button onclick="setView('table')">Tabelle</button>
-    <input type="text" class="search-box" placeholder="Suche nach Host, Titel, URL, Fehler..." oninput="onSearch(this.value)">
+    <input type="text" class="search-box" placeholder="Suche nach Host, Titel, URL, Fehler, CMS..." oninput="onSearch(this.value)">
     <select class="filter-select" onchange="onFilter(this.value)">
         <option value="all">Alle Status</option>
         <option value="2xx">2xx OK</option>
@@ -659,6 +874,11 @@ tbody td {{ padding:0.45rem 0.7rem; vertical-align:middle; border-bottom:1px sol
         <option value="4xx">4xx Client Error</option>
         <option value="5xx">5xx Server Error</option>
         <option value="err">Scan-Fehler</option>
+        <option value="new">Delta: Neu</option>
+        <option value="changed">Delta: Geändert</option>
+    </select>
+    <select class="filter-select" onchange="onCmsFilter(this.value)" id="cms-filter">
+        <option value="all">Alle CMS</option>
     </select>
 </div>
 
@@ -683,121 +903,162 @@ let view = 'cards';
 let filtered = [...ALL_DATA];
 let sortCol = null, sortAsc = true;
 let page = 1;
-let searchTerm = '', statusFilter = 'all';
+let searchTerm = '', statusFilter = 'all', cmsFilter = 'all';
+
+// Populate CMS filter
+(function() {{
+  const cms = [...new Set(ALL_DATA.map(r=>r.cms).filter(Boolean))].sort();
+  const sel = document.getElementById('cms-filter');
+  cms.forEach(c => {{ const o=document.createElement('option'); o.value=c; o.textContent=c; sel.appendChild(o); }});
+}})();
 
 function badge(st) {{
-    if (!st) return '<span class="badge badge-unknown">N/A</span>';
-    const s = parseInt(st) || 0;
-    let c = s>=200&&s<300?'ok':s>=300&&s<400?'redirect':s>=400&&s<500?'client-err':'server-err';
-    return `<span class="badge badge-${{c}}">${{st}}</span>`;
+  if (!st) return '<span class="badge badge-unknown">N/A</span>';
+  const s=parseInt(st)||0;
+  const c=s>=200&&s<300?'ok':s>=300&&s<400?'redirect':s>=400&&s<500?'client-err':'server-err';
+  return `<span class="badge badge-${{c}}">${{st}}</span>`;
 }}
 function ltHtml(lt) {{
-    if (lt==null) return '—';
-    const t = parseFloat(lt);
-    const c = t<1.5?'fast':t<3?'medium':'slow';
-    return `<span class="lt lt-${{c}}">${{t.toFixed(2)}}s</span>`;
+  if (lt==null) return '—';
+  const t=parseFloat(lt), c=t<1.5?'fast':t<3?'medium':'slow';
+  return `<span class="lt lt-${{c}}">${{t.toFixed(2)}}s</span>`;
+}}
+function secHtml(score, detail) {{
+  const c=score>=6?'high':score>=4?'mid':'low';
+  const keys=Object.keys(detail||{{}});
+  const tip=keys.map(k=>`${{detail[k]?'✓':'✗'}} ${{k}}`).join('<br>');
+  return `<span class="sec-score sec-${{c}} sec-tooltip">${{score}}/7<span class="sec-tip">${{tip}}</span></span>`;
+}}
+function deltaHtml(d) {{
+  if (!d||d==='unchanged') return '';
+  return `<span class="badge badge-${{d}}">${{d==='new'?'Neu':'Geändert'}}</span>`;
+}}
+function redirHtml(count, chain) {{
+  if (!count) return '';
+  const tip=(chain||[]).join('&#10;');
+  return `<span class="redir-chip" title="${{tip}}">↪ ${{count}}</span>`;
 }}
 function esc(s) {{ const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }}
 
 function applyFilters() {{
-    let d = ALL_DATA;
-    if (statusFilter !== 'all') {{
-        d = d.filter(r => {{
-            if (statusFilter === 'err') return !!r.error;
-            return r.status.startsWith(statusFilter[0]);
-        }});
-    }}
-    if (searchTerm) {{
-        const q = searchTerm.toLowerCase();
-        d = d.filter(r => (r.host+' '+r.title+' '+r.final_url+' '+r.error).toLowerCase().includes(q));
-    }}
-    if (sortCol !== null) {{
-        d = [...d].sort((a,b) => {{
-            let va = a[sortCol], vb = b[sortCol];
-            if (sortCol === 'load_time') {{ va = va??999; vb = vb??999; return sortAsc ? va-vb : vb-va; }}
-            if (sortCol === 'status') {{ va = parseInt(va)||999; vb = parseInt(vb)||999; return sortAsc ? va-vb : vb-va; }}
-            va = (va||'').toString().toLowerCase(); vb = (vb||'').toString().toLowerCase();
-            return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
-        }});
-    }}
-    filtered = d;
-    page = 1;
-    render();
+  let d = ALL_DATA;
+  if (statusFilter !== 'all') {{
+    d = d.filter(r => {{
+      if (statusFilter==='err')     return !!r.error;
+      if (statusFilter==='new')     return r.delta==='new';
+      if (statusFilter==='changed') return r.delta==='changed';
+      return r.status.startsWith(statusFilter[0]);
+    }});
+  }}
+  if (cmsFilter !== 'all') d = d.filter(r => r.cms === cmsFilter);
+  if (searchTerm) {{
+    const q=searchTerm.toLowerCase();
+    d = d.filter(r => (r.host+' '+r.title+' '+r.final_url+' '+r.error+' '+r.cms).toLowerCase().includes(q));
+  }}
+  if (sortCol !== null) {{
+    d = [...d].sort((a,b) => {{
+      let va=a[sortCol], vb=b[sortCol];
+      if (sortCol==='load_time')  {{ va=va??999; vb=vb??999; return sortAsc?va-vb:vb-va; }}
+      if (sortCol==='status')     {{ va=parseInt(va)||999; vb=parseInt(vb)||999; return sortAsc?va-vb:vb-va; }}
+      if (sortCol==='sec_score')  {{ va=va??0; vb=vb??0; return sortAsc?va-vb:vb-va; }}
+      va=(va||'').toString().toLowerCase(); vb=(vb||'').toString().toLowerCase();
+      return sortAsc?va.localeCompare(vb):vb.localeCompare(va);
+    }});
+  }}
+  filtered=d; page=1; render();
 }}
 
-function onSearch(v) {{ searchTerm = v; applyFilters(); }}
-function onFilter(v) {{ statusFilter = v; applyFilters(); }}
+function onSearch(v)    {{ searchTerm=v;    applyFilters(); }}
+function onFilter(v)    {{ statusFilter=v;  applyFilters(); }}
+function onCmsFilter(v) {{ cmsFilter=v;     applyFilters(); }}
 function setView(v) {{
-    view = v;
-    document.getElementById('cards-wrap').classList.toggle('active', v==='cards');
-    document.getElementById('table-wrap').classList.toggle('active', v==='table');
-    document.querySelectorAll('.toolbar button').forEach((b,i) => b.classList.toggle('active', (i===0&&v==='cards')||(i===1&&v==='table')));
-    render();
+  view=v;
+  document.getElementById('cards-wrap').classList.toggle('active', v==='cards');
+  document.getElementById('table-wrap').classList.toggle('active', v==='table');
+  document.querySelectorAll('.toolbar button').forEach((b,i)=>b.classList.toggle('active',(i===0&&v==='cards')||(i===1&&v==='table')));
+  render();
 }}
-function setPage(p) {{ page = p; render(); window.scrollTo({{top: document.querySelector('.toolbar').offsetTop - 10, behavior:'smooth'}}); }}
+function setPage(p) {{ page=p; render(); window.scrollTo({{top:document.querySelector('.toolbar').offsetTop-10,behavior:'smooth'}}); }}
 
 function render() {{
-    const total = filtered.length;
-    const pages = Math.max(1, Math.ceil(total / PER_PAGE));
-    if (page > pages) page = pages;
-    const start = (page-1)*PER_PAGE, end = Math.min(start+PER_PAGE, total);
-    const slice = filtered.slice(start, end);
+  const total=filtered.length;
+  const pages=Math.max(1,Math.ceil(total/PER_PAGE));
+  if (page>pages) page=pages;
+  const start=(page-1)*PER_PAGE, end=Math.min(start+PER_PAGE,total);
+  const slice=filtered.slice(start,end);
 
-    // Cards
-    const cc = document.getElementById('cards-container');
-    cc.innerHTML = slice.map(r => {{
-        const img = r.thumb ? `<img src="${{r.thumb}}" alt="${{esc(r.host)}}" loading="lazy">` : '<div class="no-preview">Kein Preview</div>';
-        const ssl = r.ssl_expiry ? `<span class="card-ssl">🔒 ${{esc(r.ssl_expiry)}}</span>` : '';
-        const err = r.error ? `<div class="card-error">${{esc(r.error.substring(0,120))}}</div>` : '';
-        return `<div class="card"><div class="card-image">${{img}}</div><div class="card-body"><h3 class="card-title">${{esc(r.host)}}</h3><div class="card-meta">${{badge(r.status)}} ${{ltHtml(r.load_time)}} ${{ssl}}</div><div class="card-pagetitle">${{esc((r.title||'—').substring(0,60))}}</div><a class="card-url" href="${{esc(r.final_url)}}" target="_blank" rel="noopener">${{esc((r.final_url||'—').substring(0,70))}}</a>${{err}}</div></div>`;
-    }}).join('');
+  // ── Cards ──
+  document.getElementById('cards-container').innerHTML = slice.map(r => {{
+    const img   = r.thumb ? `<img src="${{r.thumb}}" alt="${{esc(r.host)}}" loading="lazy">` : '<div class="no-preview">Kein Preview</div>';
+    const ssl   = r.ssl_expiry ? `<span class="card-ssl">🔒 ${{esc(r.ssl_expiry)}}</span>` : '';
+    const cms   = r.cms ? `<span class="badge badge-cms">${{esc(r.cms)}}</span>` : '';
+    const sec   = secHtml(r.sec_score, r.sec_detail);
+    const redir = redirHtml(r.redirect_count, r.redirect_chain);
+    const delta = deltaHtml(r.delta);
+    const err   = r.error ? `<div class="card-error">${{esc(r.error.substring(0,120))}}</div>` : '';
+    return `<div class="card"><div class="card-image">${{img}}</div><div class="card-body">
+      <h3 class="card-title">${{esc(r.host)}} ${{delta}}</h3>
+      <div class="card-meta">${{badge(r.status)}} ${{ltHtml(r.load_time)}} ${{ssl}} ${{redir}}</div>
+      <div class="card-meta">${{cms}} ${{sec}}</div>
+      <div class="card-pagetitle">${{esc((r.title||'—').substring(0,60))}}</div>
+      <a class="card-url" href="${{esc(r.final_url)}}" target="_blank" rel="noopener">${{esc((r.final_url||'—').substring(0,70))}}</a>
+      ${{err}}</div></div>`;
+  }}).join('');
 
-    // Table
-    const cols = [
-        ['thumb','Preview',false], ['host','Host',true], ['status','Status',true],
-        ['load_time','Ladezeit',true], ['ssl_expiry','SSL bis',true],
-        ['title','Titel',true], ['final_url','URL',true], ['error','Fehler',true]
-    ];
-    const th = document.getElementById('table-head');
-    th.innerHTML = cols.map(([key,label,sortable]) => {{
-        const arrow = sortCol===key ? (sortAsc?'▲':'▼') : '⇅';
-        const cls = sortCol===key ? ' class="sorted"' : '';
-        return sortable
-            ? `<th${{cls}} onclick="doSort('${{key}}')">${{label}}<span class="sort-arrow">${{arrow}}</span></th>`
-            : `<th>${{label}}</th>`;
-    }}).join('');
+  // ── Table ──
+  const cols = [
+    ['thumb','Preview',false],['host','Host',true],['status','Status',true],
+    ['load_time','Ladezeit',true],['ssl_expiry','SSL bis',true],['cms','CMS',true],
+    ['sec_score','Sec.',true],['redirect_count','Redir.',true],
+    ['title','Titel',true],['final_url','URL',true],['delta','Delta',true],['error','Fehler',true]
+  ];
+  document.getElementById('table-head').innerHTML = cols.map(([key,label,sortable]) => {{
+    const arrow=sortCol===key?(sortAsc?'▲':'▼'):'⇅';
+    const cls=sortCol===key?' class="sorted"':'';
+    return sortable ? `<th${{cls}} onclick="doSort('${{key}}')">${{label}}<span class="sort-arrow">${{arrow}}</span></th>` : `<th>${{label}}</th>`;
+  }}).join('');
 
-    const tb = document.getElementById('table-body');
-    tb.innerHTML = slice.map((r,i) => {{
-        const cls = i%2===0 ? 'row-even' : 'row-odd';
-        const img = r.thumb ? `<img src="${{r.thumb}}" class="table-thumb">` : '<span class="no-img">—</span>';
-        const err = r.error ? `<span class="err-text">${{esc(r.error.substring(0,80))}}</span>` : '—';
-        return `<tr class="${{cls}}"><td>${{img}}</td><td class="cell-host">${{esc(r.host)}}</td><td class="cell-center">${{badge(r.status)}}</td><td class="cell-center">${{ltHtml(r.load_time)}}</td><td class="cell-center">${{esc(r.ssl_expiry||'—')}}</td><td>${{esc((r.title||'—').substring(0,50))}}</td><td class="cell-url"><a href="${{esc(r.final_url)}}" target="_blank">${{esc((r.final_url||'—').substring(0,55))}}</a></td><td>${{err}}</td></tr>`;
-    }}).join('');
+  document.getElementById('table-body').innerHTML = slice.map((r,i) => {{
+    const cls=i%2===0?'row-even':'row-odd';
+    const img=r.thumb?`<img src="${{r.thumb}}" class="table-thumb">`:'<span class="no-img">—</span>';
+    const err=r.error?`<span class="err-text">${{esc(r.error.substring(0,80))}}</span>`:'—';
+    const chain=(r.redirect_chain||[]).join('\n');
+    return `<tr class="${{cls}}">
+      <td>${{img}}</td>
+      <td class="cell-host">${{esc(r.host)}}</td>
+      <td class="cell-center">${{badge(r.status)}}</td>
+      <td class="cell-center">${{ltHtml(r.load_time)}}</td>
+      <td class="cell-center">${{esc(r.ssl_expiry||'—')}}</td>
+      <td class="cell-center">${{r.cms?`<span class="badge badge-cms">${{esc(r.cms)}}</span>`:'—'}}</td>
+      <td class="cell-center">${{secHtml(r.sec_score,r.sec_detail)}}</td>
+      <td class="cell-center">${{r.redirect_count?`<span class="redir-chip" title="${{esc(chain)}}">${{r.redirect_count}}x</span>`:'—'}}</td>
+      <td>${{esc((r.title||'—').substring(0,50))}}</td>
+      <td class="cell-url"><a href="${{esc(r.final_url)}}" target="_blank">${{esc((r.final_url||'—').substring(0,55))}}</a></td>
+      <td class="cell-center">${{deltaHtml(r.delta)}}</td>
+      <td>${{err}}</td></tr>`;
+  }}).join('');
 
-    // Pagination
-    const pg = document.getElementById('pagination');
-    if (pages <= 1) {{ pg.innerHTML = `<span class="page-info">${{total}} Hosts</span>`; return; }}
-    let h = `<button ${{page===1?'disabled':''}} onclick="setPage(${{page-1}})">‹</button>`;
-    const maxBtns = 9;
-    let pStart = Math.max(1, page - Math.floor(maxBtns/2));
-    let pEnd = Math.min(pages, pStart + maxBtns - 1);
-    if (pEnd - pStart < maxBtns - 1) pStart = Math.max(1, pEnd - maxBtns + 1);
-    if (pStart > 1) h += `<button onclick="setPage(1)">1</button><span class="page-info">…</span>`;
-    for (let p=pStart; p<=pEnd; p++) h += `<button class="${{p===page?'active':''}}" onclick="setPage(${{p}})">${{p}}</button>`;
-    if (pEnd < pages) h += `<span class="page-info">…</span><button onclick="setPage(${{pages}})">${{pages}}</button>`;
-    h += `<button ${{page===pages?'disabled':''}} onclick="setPage(${{page+1}})">›</button>`;
-    h += `<span class="page-info">${{start+1}}–${{end}} von ${{total}}</span>`;
-    pg.innerHTML = h;
+  // ── Pagination ──
+  const pg=document.getElementById('pagination');
+  if (pages<=1) {{ pg.innerHTML=`<span class="page-info">${{total}} Hosts</span>`; return; }}
+  let h=`<button ${{page===1?'disabled':''}} onclick="setPage(${{page-1}})">‹</button>`;
+  const maxBtns=9;
+  let pStart=Math.max(1,page-Math.floor(maxBtns/2));
+  let pEnd=Math.min(pages,pStart+maxBtns-1);
+  if (pEnd-pStart<maxBtns-1) pStart=Math.max(1,pEnd-maxBtns+1);
+  if (pStart>1) h+=`<button onclick="setPage(1)">1</button><span class="page-info">…</span>`;
+  for (let p=pStart;p<=pEnd;p++) h+=`<button class="${{p===page?'active':''}}" onclick="setPage(${{p}})">${{p}}</button>`;
+  if (pEnd<pages) h+=`<span class="page-info">…</span><button onclick="setPage(${{pages}})">${{pages}}</button>`;
+  h+=`<button ${{page===pages?'disabled':''}} onclick="setPage(${{page+1}})">›</button>`;
+  h+=`<span class="page-info">${{start+1}}–${{end}} von ${{total}}</span>`;
+  pg.innerHTML=h;
 }}
 
 function doSort(col) {{
-    if (sortCol === col) sortAsc = !sortAsc;
-    else {{ sortCol = col; sortAsc = true; }}
-    applyFilters();
+  if (sortCol===col) sortAsc=!sortAsc; else {{sortCol=col; sortAsc=true;}}
+  applyFilters();
 }}
 
-// Init
 render();
 </script>
 </body></html>"""
@@ -807,32 +1068,85 @@ render();
     log("HTML report written.")
 
 
+# ── Parallel worker ───────────────────────────────────────────────────────────
+
+_print_lock = threading.Lock()
+
+
+def _worker(host_queue: queue.Queue, results: list, counter: list, total: int):
+    """Each worker owns its own sync_playwright + browser + page."""
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx     = browser.new_context(viewport={"width": 1280, "height": 800})
+        page    = ctx.new_page()
+        page.set_default_timeout(PAGE_TIMEOUT)
+        try:
+            while True:
+                try:
+                    idx, host = host_queue.get_nowait()
+                except queue.Empty:
+                    break
+                result = scan_host(page, browser, host)
+                results[idx] = result
+                with _print_lock:
+                    counter[0] += 1
+                    n      = counter[0]
+                    status = result["status"] or "ERR"
+                    lt     = f'{result["load_time"]}s' if result["load_time"] else ""
+                    cms    = f' [{result["cms"]}]' if result.get("cms") else ""
+                    sec    = f' sec:{result.get("security_headers", {}).get("_score", 0)}/7'
+                    redir  = f' ↪{len(result["redirect_chain"])}' if result.get("redirect_chain") else ""
+                    print(f"  [{n}/{total}] {host} → {status} {lt}{redir}{cms}{sec}")
+                host_queue.task_done()
+        finally:
+            ctx.close()
+            browser.close()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main(input_file):
-    hosts = load_hosts(input_file)
-    results = []
+    hosts    = load_hosts(input_file)
+    previous = load_previous_results()
+    total    = len(hosts)
+    workers  = min(WORKERS, total) if total else 1
 
-    print(f"Web Inventory Reporter — {len(hosts)} Hosts")
+    print(f"Web Inventory Reporter — {total} Hosts | {workers} Workers")
     print("─" * 50)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(viewport={"width": 1280, "height": 800})
+    # Fill queue
+    host_queue = queue.Queue()
+    for i, host in enumerate(hosts):
+        host_queue.put((i, host))
 
-        for i, host in enumerate(hosts, 1):
-            print(f"  [{i}/{len(hosts)}] {host} ...", end=" ", flush=True)
-            result = scan_host(page, browser, host)
-            status = result["status"] or "ERR"
-            lt = f'{result["load_time"]}s' if result["load_time"] else ""
-            print(f"→ {status} {lt}")
-            results.append(result)
+    results = [None] * total
+    counter = [0]
 
-        browser.close()
+    threads = [
+        threading.Thread(target=_worker, args=(host_queue, results, counter, total), daemon=True)
+        for _ in range(workers)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
+    results = [r for r in results if r is not None]
     if not results:
         print("Keine Hosts gefunden.")
         return
+
+    # Delta
+    for r in results:
+        r["delta"] = compute_delta(r, previous)
+
+    # Mark hosts that disappeared since last scan
+    current_hosts = {r["host"] for r in results}
+    gone = [h for h in previous if h not in current_hosts]
+    if gone:
+        print(f"  Weggefallen seit letztem Scan: {', '.join(gone)}")
+
+    save_results_json(results)
 
     print(f"\n{'─'*50}")
     print(f"Reports für {len(results)} Hosts ...")
