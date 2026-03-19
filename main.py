@@ -1,3 +1,4 @@
+import configparser
 import csv
 import sys
 import re
@@ -16,6 +17,8 @@ from openpyxl.formatting.rule import CellIsRule
 from openpyxl.utils import get_column_letter
 from PIL import Image
 
+CONFIG_FILE = "config.ini"
+
 OUTPUT_DIR = Path("output")
 SCREENSHOT_DIR = OUTPUT_DIR / "screenshots"
 THUMB_DIR = OUTPUT_DIR / "thumbnails"
@@ -25,12 +28,37 @@ SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 THUMB_DIR.mkdir(parents=True, exist_ok=True)
 (LOG_FILE.parent).mkdir(parents=True, exist_ok=True)
 
-# SRG SSR Official Brand Colors (from Design Guidelines Manual)
-SRG_RED = "af001d"
-SRG_GRAY = "333333"
-SRG_WHITE = "ffffff"
-SRG_LIGHT_BG = "f5f5f5"
-SRG_BORDER = "dee2e6"
+
+def load_config() -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({
+        "general": {"domains_file": "domains.txt"},
+        "author":  {"name": "Your Name", "email": ""},
+        "titles":  {
+            "main_title":       "Your Name \u2013 Web Inventory Report",
+            "subtitle":         "Automatisierte Website-\u00dcbersicht",
+            "sheet_inventory":  "Web Inventory",
+            "sheet_summary":    "Zusammenfassung",
+        },
+        "colors":  {
+            "primary":  "af001d",
+            "dark":     "333333",
+            "white":    "ffffff",
+            "light_bg": "f5f5f5",
+            "border":   "dee2e6",
+        },
+    })
+    cfg.read(CONFIG_FILE, encoding="utf-8")
+    return cfg
+
+
+CFG = load_config()
+_c = CFG["colors"]
+SRG_RED     = _c["primary"]
+SRG_GRAY    = _c["dark"]
+SRG_WHITE   = _c["white"]
+SRG_LIGHT_BG = _c["light_bg"]
+SRG_BORDER  = _c["border"]
 
 # Thumbnail: fixed 16:10, smaller for 600+ hosts
 THUMB_WIDTH = 320
@@ -147,16 +175,18 @@ def write_csv(data):
 # ── Excel ────────────────────────────────────────────────────────────────────
 
 def write_excel(data):
+    _a = CFG["author"]
+    _t = CFG["titles"]
     wb = Workbook()
-    wb.properties.creator = "Markus Gerber"
-    wb.properties.title = "Web Inventory Report – SRG SSR"
-    wb.properties.subject = "Automatisierte Website-Übersicht"
+    wb.properties.creator = _a["name"]
+    wb.properties.title = _t["main_title"]
+    wb.properties.subject = _t["subtitle"]
     wb.properties.description = (
-        "Erstellt mit Web Inventory Reporter\n"
-        "Markus Gerber\n"
-        "markus.gerber@srgssr.ch | markus.gerber@npn.ch"
+        f"Erstellt mit Web Inventory Reporter\n"
+        f"{_a['name']}\n"
+        f"{_a['email']}"
     )
-    wb.properties.company = "SRG SSR"
+    wb.properties.company = ""
 
     # ── Styles ──
     hdr_font = Font(name="Arial", bold=True, color=SRG_WHITE, size=11)
@@ -185,7 +215,7 @@ def write_excel(data):
     # Sheet 1: Zusammenfassung
     # ═══════════════════════════════════════════════════════════════════════
     ws_sum = wb.active
-    ws_sum.title = "Zusammenfassung"
+    ws_sum.title = _t["sheet_summary"]
     ws_sum.sheet_properties.tabColor = SRG_RED
 
     ts = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -206,11 +236,11 @@ def write_excel(data):
     ws_sum.column_dimensions["D"].width = 28
     ws_sum.column_dimensions["E"].width = 18
 
-    ws_sum["B2"] = "Web Inventory Report"
+    ws_sum["B2"] = _t["main_title"]
     ws_sum["B2"].font = title_font
-    ws_sum["B3"] = f"SRG SSR · Erstellt: {ts}"
+    ws_sum["B3"] = f"Erstellt: {ts}"
     ws_sum["B3"].font = subtitle_font
-    ws_sum["B4"] = "Markus Gerber · markus.gerber@srgssr.ch · markus.gerber@npn.ch"
+    ws_sum["B4"] = f"{_a['name']} · {_a['email']}"
     ws_sum["B4"].font = Font(name="Arial", size=9, color="6c757d")
 
     r = 6
@@ -322,7 +352,7 @@ def write_excel(data):
     # ═══════════════════════════════════════════════════════════════════════
     # Sheet 2: Web Inventory (Daten)
     # ═══════════════════════════════════════════════════════════════════════
-    ws = wb.create_sheet("Web Inventory")
+    ws = wb.create_sheet(_t["sheet_inventory"])
 
     headers = ["Host", "Status", "Ladezeit (s)", "SSL gültig bis", "Final URL", "Titel", "Fehler", "Preview"]
     col_widths = [28, 10, 14, 16, 45, 35, 35, 30]
@@ -405,6 +435,8 @@ def lt_indicator(lt):
 
 
 def write_html(data):
+    _a = CFG["author"]
+    _t = CFG["titles"]
     ts = datetime.now().strftime("%d.%m.%Y %H:%M")
     total = len(data)
     ok = sum(1 for d in data if str(d.get("status", "")).startswith("2"))
@@ -435,7 +467,7 @@ def write_html(data):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Web Inventory Report — SRG SSR</title>
+<title>{_t['main_title']}</title>
 <style>
 :root {{
     --srg-red: #af001d;
@@ -543,7 +575,7 @@ tbody td {{ padding:0.45rem 0.7rem; vertical-align:middle; border-bottom:1px sol
 <body>
 
 <div class="header">
-    <div><h1>Web Inventory Report</h1><div class="sub">SRG SSR · Automatisierte Website-Übersicht</div></div>
+    <div><h1>{_t['main_title']}</h1><div class="sub">{_t['subtitle']}</div></div>
     <div class="header-meta">Erstellt: {ts}<br>Hosts: {total}</div>
 </div>
 
@@ -579,8 +611,8 @@ tbody td {{ padding:0.45rem 0.7rem; vertical-align:middle; border-bottom:1px sol
 <div class="pagination" id="pagination"></div>
 
 <div class="footer">
-    Web Inventory Reporter · SRG SSR · {ts}<br>
-    Markus Gerber · <a href="mailto:markus.gerber@srgssr.ch">markus.gerber@srgssr.ch</a> · <a href="mailto:markus.gerber@npn.ch">markus.gerber@npn.ch</a>
+    Web Inventory Reporter · {ts}<br>
+    {_a['name']} · <a href="mailto:{_a['email']}">{_a['email']}</a>
 </div>
 
 <script>
@@ -754,7 +786,6 @@ def main(input_file):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python main.py domains.txt")
-        sys.exit(1)
-    main(sys.argv[1])
+    default_file = CFG["general"]["domains_file"]
+    input_file = sys.argv[1] if len(sys.argv) >= 2 else default_file
+    main(input_file)
