@@ -122,42 +122,103 @@ def get_ssl_info(host):
         return ""
 
 
-def scan_host(page, host):
+def get_ssl_info_insecure(host):
+    """Get SSL cert expiry even for invalid/expired certs (no validation)."""
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_OPTIONAL
+        with ctx.wrap_socket(socket.socket(), server_hostname=host) as s:
+            s.settimeout(5)
+            s.connect((host, 443))
+            cert = s.getpeercertificate()
+            if cert and "notAfter" in cert:
+                expiry = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                return expiry.strftime("%d.%m.%Y")
+    except Exception:
+        pass
+    return ""
+
+
+# Error keywords that indicate a cert/SSL issue worth retrying with ignore_https_errors
+_CERT_ERROR_KEYWORDS = [
+    "ERR_CERT_", "ERR_SSL_", "ERR_TLS_", "certificate", "ssl",
+    "SEC_ERROR_", "MOZILLA_PKIX_ERROR_", "ERR_HTTP2_",
+    "ERR_CONTENT_DECODING_", "ERR_EMPTY_RESPONSE",
+]
+
+
+def _is_ignorable_error(msg: str) -> bool:
+    m = msg.lower()
+    return any(k.lower() in m for k in _CERT_ERROR_KEYWORDS)
+
+
+def _do_scan(page, url, host):
+    """Perform a single goto + screenshot, return result dict."""
+    start = time.time()
+    response = page.goto(url, timeout=15000)
+    load_time = round(time.time() - start, 2)
+    final_url = page.url
+    title = page.title()
+    filename = sanitize(host)
+    screenshot_path = SCREENSHOT_DIR / f"{filename}.png"
+    thumb_path = THUMB_DIR / f"{filename}.jpg"
+    page.screenshot(path=str(screenshot_path), full_page=False)
+    create_thumbnail_16_10(screenshot_path, thumb_path)
+    return {
+        "status": response.status if response else "",
+        "final_url": final_url,
+        "title": title,
+        "load_time": load_time,
+        "screenshot": str(screenshot_path),
+        "thumbnail": str(thumb_path),
+    }
+
+
+def scan_host(page, browser, host):
     urls = [f"https://{host}", f"http://{host}"]
+    last_error = ""
+
     for url in urls:
+        # ── Normal attempt (strict SSL) ───────────────────────────────────
         try:
-            start = time.time()
-            response = page.goto(url, timeout=15000)
-            load_time = round(time.time() - start, 2)
-            final_url = page.url
-            title = page.title()
-            filename = sanitize(host)
+            info = _do_scan(page, url, host)
             ssl_expiry = get_ssl_info(host)
-
-            screenshot_path = SCREENSHOT_DIR / f"{filename}.png"
-            thumb_path = THUMB_DIR / f"{filename}.jpg"
-
-            page.screenshot(path=str(screenshot_path), full_page=False)
-            create_thumbnail_16_10(screenshot_path, thumb_path)
-
             return {
-                "host": host,
-                "status": response.status if response else "",
-                "final_url": final_url,
-                "title": title,
-                "load_time": load_time,
-                "ssl_expiry": ssl_expiry,
-                "screenshot": str(screenshot_path),
-                "thumbnail": str(thumb_path),
-                "error": ""
+                "host": host, **info,
+                "ssl_expiry": ssl_expiry, "error": "",
             }
         except Exception as e:
-            last_error = str(e)
+            err_str = str(e)
+            last_error = err_str
+            log(f"Error on {url}: {err_str}")
+
+            # ── Retry with ignore_https_errors for cert/SSL issues ────────
+            if _is_ignorable_error(err_str):
+                try:
+                    ctx = browser.new_context(
+                        viewport={"width": 1280, "height": 800},
+                        ignore_https_errors=True,
+                    )
+                    p2 = ctx.new_page()
+                    try:
+                        info = _do_scan(p2, url, host)
+                        ssl_expiry = get_ssl_info_insecure(host)
+                        return {
+                            "host": host, **info,
+                            "ssl_expiry": ssl_expiry,
+                            "error": err_str,
+                        }
+                    finally:
+                        ctx.close()
+                except Exception as e2:
+                    log(f"Retry failed for {host}: {e2}")
+                    last_error = err_str  # keep original error
 
     return {
         "host": host, "status": "", "final_url": "", "title": "",
         "load_time": "", "ssl_expiry": "", "screenshot": "",
-        "thumbnail": "", "error": last_error
+        "thumbnail": "", "error": last_error,
     }
 
 
@@ -761,7 +822,7 @@ def main(input_file):
 
         for i, host in enumerate(hosts, 1):
             print(f"  [{i}/{len(hosts)}] {host} ...", end=" ", flush=True)
-            result = scan_host(page, host)
+            result = scan_host(page, browser, host)
             status = result["status"] or "ERR"
             lt = f'{result["load_time"]}s' if result["load_time"] else ""
             print(f"→ {status} {lt}")
