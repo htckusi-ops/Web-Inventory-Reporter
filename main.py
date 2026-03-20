@@ -53,10 +53,12 @@ def load_config() -> configparser.ConfigParser:
             "border":   "dee2e6",
         },
         "scan": {
-            "workers":       "4",
-            "goto_timeout":  "15000",
-            "page_timeout":  "30000",
-            "ssl_timeout":   "5",
+            "workers":           "4",
+            "goto_timeout":      "15000",
+            "page_timeout":      "30000",
+            "ssl_timeout":       "5",
+            "screenshot_delay":  "1500",
+            "card_width":        "240",
         },
     })
     cfg.read(CONFIG_FILE, encoding="utf-8")
@@ -72,10 +74,12 @@ SRG_LIGHT_BG = _c["light_bg"]
 SRG_BORDER   = _c["border"]
 
 _s = CFG["scan"]
-WORKERS      = int(_s["workers"])
-GOTO_TIMEOUT = int(_s["goto_timeout"])
-PAGE_TIMEOUT = int(_s["page_timeout"])
-SSL_TIMEOUT  = int(_s["ssl_timeout"])
+WORKERS           = int(_s["workers"])
+GOTO_TIMEOUT      = int(_s["goto_timeout"])
+PAGE_TIMEOUT      = int(_s["page_timeout"])
+SSL_TIMEOUT       = int(_s["ssl_timeout"])
+SCREENSHOT_DELAY  = int(_s["screenshot_delay"])
+CARD_WIDTH        = int(_s["card_width"])
 
 THUMB_WIDTH  = 320
 THUMB_HEIGHT = 200
@@ -240,6 +244,8 @@ def _do_scan(page, url, host):
 
         screenshot_path = SCREENSHOT_DIR / f"{filename}.png"
         thumb_path      = THUMB_DIR      / f"{filename}.jpg"
+        if SCREENSHOT_DELAY > 0:
+            page.wait_for_timeout(SCREENSHOT_DELAY)
         page.screenshot(path=str(screenshot_path), full_page=False)
         create_thumbnail_16_10(screenshot_path, thumb_path)
 
@@ -758,7 +764,7 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,
 .search-box:focus {{ border-color:var(--srg-red); }}
 .filter-select {{ padding:0.4rem 0.6rem; border:1px solid var(--srg-border); border-radius:var(--r); font-size:0.82rem; font-family:inherit; background:var(--srg-white); }}
 
-.cards {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:1rem; padding:0.8rem 2.5rem 1rem; }}
+.cards {{ display:grid; grid-template-columns:repeat(auto-fill,minmax({CARD_WIDTH}px,1fr)); gap:1rem; padding:0.8rem 2.5rem 1rem; }}
 .card {{ background:var(--srg-white); border-radius:var(--r); overflow:hidden; border:1px solid var(--srg-border); transition:box-shadow 0.2s,transform 0.15s; }}
 .card:hover {{ box-shadow:0 4px 16px rgba(0,0,0,0.07); transform:translateY(-1px); }}
 .card-image {{ background:#eaeaea; aspect-ratio:16/10; overflow:hidden; display:flex; align-items:flex-start; }}
