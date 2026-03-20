@@ -1095,6 +1095,12 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,
 .card-ns {{ }}
 .card-asn {{ }}
 .cell-asn {{ font-size:0.75rem; color:var(--srg-gray-light); }}
+.filter-link {{ cursor:pointer; border-radius:3px; }}
+.filter-link:hover {{ opacity:0.7; text-decoration:underline; outline:1px dashed currentColor; }}
+.filter-active-bar {{ display:flex; align-items:center; gap:0.6rem; padding:0.45rem 2.5rem; background:var(--srg-yellow-bg); border-bottom:1px solid #ffe69c; font-size:0.82rem; color:var(--srg-yellow); }}
+.filter-active-bar .f-tag {{ background:var(--srg-yellow); color:#fff; padding:0.15rem 0.55rem; border-radius:4px; font-weight:700; font-size:0.78rem; }}
+.filter-active-bar button {{ padding:0.15rem 0.6rem; border:1px solid var(--srg-yellow); border-radius:4px; background:transparent; color:var(--srg-yellow); cursor:pointer; font-size:0.78rem; font-family:inherit; }}
+.filter-active-bar button:hover {{ background:var(--srg-yellow); color:#fff; }}
 .card-error {{ margin-top:0.4rem; padding:0.3rem 0.5rem; background:#fde8e8; border-radius:4px; font-size:0.72rem; color:var(--srg-red); }}
 .cell-ip {{ font-size:0.78rem; font-family:monospace; white-space:nowrap; }}
 .cell-ns {{ font-size:0.75rem; color:var(--srg-gray-light); }}
@@ -1198,6 +1204,12 @@ tbody td {{ padding:0.45rem 0.7rem; vertical-align:middle; border-bottom:1px sol
     </select>
 </div>
 
+<div id="host-filter-bar" style="display:none" class="filter-active-bar">
+    <span class="f-tag" id="host-filter-label"></span>
+    <span id="host-filter-count"></span>
+    <button onclick="clearHostFilter()">✕ Filter aufheben</button>
+</div>
+
 <div class="cards-wrap active" id="cards-wrap"><div class="cards" id="cards-container"></div></div>
 <div class="table-wrap" id="table-wrap">
     <table>
@@ -1220,6 +1232,7 @@ let filtered = [...ALL_DATA];
 let sortCol = null, sortAsc = true;
 let page = 1;
 let searchTerm = '', statusFilter = 'all', cmsFilter = 'all';
+let hostFilter = null; // {{type:'ip'|'ns'|'cdn'|'asn', value:'...'}}
 
 // Populate CMS filter
 (function() {{
@@ -1267,6 +1280,15 @@ function applyFilters() {{
     }});
   }}
   if (cmsFilter !== 'all') d = d.filter(r => r.cms === cmsFilter);
+  if (hostFilter) {{
+    d = d.filter(r => {{
+      if (hostFilter.type==='ip')  return r.ip === hostFilter.value;
+      if (hostFilter.type==='ns')  return (r.nameservers||'').split(',').map(s=>s.trim()).includes(hostFilter.value);
+      if (hostFilter.type==='cdn') return r.cdn === hostFilter.value;
+      if (hostFilter.type==='asn') return r.asn === hostFilter.value;
+      return true;
+    }});
+  }}
   if (searchTerm) {{
     const q=searchTerm.toLowerCase();
     d = d.filter(r => (r.host+' '+r.title+' '+r.final_url+' '+r.error+' '+r.cms+' '+r.cdn+' '+r.asn+' '+(r.asn_name||'')+' '+(r.scan_state||'')).toLowerCase().includes(q));
@@ -1281,7 +1303,27 @@ function applyFilters() {{
       return sortAsc?va.localeCompare(vb):vb.localeCompare(va);
     }});
   }}
-  filtered=d; page=1; render();
+  filtered=d; page=1;
+  // Update filter bar
+  const bar=document.getElementById('host-filter-bar');
+  if (hostFilter) {{
+    const labels={{'ip':'🖥 IP','ns':'🌐 Nameserver','cdn':'CDN','asn':'🏢 ASN'}};
+    document.getElementById('host-filter-label').textContent=`${{labels[hostFilter.type]||hostFilter.type}}: ${{hostFilter.value}}`;
+    document.getElementById('host-filter-count').textContent=`(${{d.length}} Host${{d.length!==1?'s':''}})`;
+    bar.style.display='flex';
+  }} else {{
+    bar.style.display='none';
+  }}
+  render();
+}}
+
+function setHostFilter(type, value) {{
+  hostFilter = {{type, value}};
+  applyFilters();
+}}
+function clearHostFilter() {{
+  hostFilter = null;
+  applyFilters();
 }}
 
 function onSearch(v)    {{ searchTerm=v;    applyFilters(); }}
@@ -1308,18 +1350,17 @@ function render() {{
     const img   = r.thumb ? `<img src="${{r.thumb}}" alt="${{esc(r.host)}}" loading="lazy">` : '<div class="no-preview">Kein Preview</div>';
     const ssl   = r.ssl_expiry ? `<span class="card-ssl">🔒 ${{esc(r.ssl_expiry)}}</span>` : '';
     const cms   = r.cms ? `<span class="badge badge-cms">${{esc(r.cms)}}</span>` : '';
-    const cdn   = r.cdn ? `<span class="badge badge-cdn">${{esc(r.cdn)}}</span>` : '';
+    const cdn   = r.cdn ? `<span class="badge badge-cdn filter-link" data-ftype="cdn" data-fval="${{esc(r.cdn)}}" title="Filter: alle Hosts hinter ${{esc(r.cdn)}}">${{esc(r.cdn)}}</span>` : '';
     const sec   = secHtml(r.sec_score, r.sec_detail);
     const redir = redirHtml(r.redirect_count, r.redirect_chain);
     const delta = deltaHtml(r.delta);
     const err    = r.error ? `<div class="card-error">${{esc(r.error.substring(0,120))}}</div>` : '';
     const urlPfx = r.redirect_count > 0 ? '→ ' : '';
-    const asnLine = r.asn ? `<br><span class="card-asn">🏢 ${{esc(r.asn)}}${{r.asn_name ? ' · ' + esc(r.asn_name) : ''}}${{r.hosting_country ? ' (' + esc(r.hosting_country) + ')' : ''}}</span>` : '';
-    const dnsBlock = (r.ip || r.nameservers || r.asn) ? `<div class="card-dns">${{
-      r.ip ? `<span class="card-ip" title="${{esc(r.reverse_dns ? r.reverse_dns + ' (' + r.ip + ')' : r.ip)}}">🖥 ${{esc(r.ip)}}</span>` : ''
-    }}${{
-      r.nameservers ? (r.ip ? '<br>' : '') + `<span class="card-ns">🌐 ${{esc(r.nameservers)}}</span>` : ''
-    }}${{asnLine}}</div>` : '';
+    const ipEl  = r.ip ? `<span class="card-ip filter-link" data-ftype="ip" data-fval="${{esc(r.ip)}}" title="Filter: alle Hosts auf IP ${{esc(r.ip)}}&#10;${{esc(r.reverse_dns||'')}}">🖥 ${{esc(r.ip)}}</span>` : '';
+    const nsEls = (r.nameservers||'').split(',').filter(s=>s.trim()).map(ns=>`<span class="filter-link" data-ftype="ns" data-fval="${{ns.trim()}}" title="Filter: alle Hosts mit NS ${{ns.trim()}}">${{esc(ns.trim())}}</span>`).join(' · ');
+    const nsEl  = nsEls ? (r.ip?'<br>':'')+'<span class="card-ns">🌐 '+nsEls+'</span>' : '';
+    const asnEl = r.asn ? `<br><span class="card-asn filter-link" data-ftype="asn" data-fval="${{esc(r.asn)}}" title="Filter: alle Hosts bei ${{esc(r.asn)}}">🏢 ${{esc(r.asn)}}${{r.asn_name ? ' · ' + esc(r.asn_name) : ''}}${{r.hosting_country ? ' (' + esc(r.hosting_country) + ')' : ''}}</span>` : '';
+    const dnsBlock = (r.ip || r.nameservers || r.asn) ? `<div class="card-dns">${{ipEl}}${{nsEl}}${{asnEl}}</div>` : '';
     return `<div class="card"><div class="card-image">${{img}}</div><div class="card-body">
       <h3 class="card-title">${{esc(r.host)}} ${{delta}}</h3>
       <div class="card-meta">${{badge(r.status)}} ${{ltHtml(r.load_time)}} ${{ssl}} ${{redir}}</div>
@@ -1359,11 +1400,11 @@ function render() {{
       <td class="cell-center">${{ltHtml(r.load_time)}}</td>
       <td class="cell-center">${{esc(r.ssl_expiry||'—')}}</td>
       <td class="cell-center">${{r.cms?`<span class="badge badge-cms">${{esc(r.cms)}}</span>`:'—'}}</td>
-      <td class="cell-center">${{r.cdn?`<span class="badge badge-cdn">${{esc(r.cdn)}}</span>`:'—'}}</td>
+      <td class="cell-center">${{r.cdn?`<span class="badge badge-cdn filter-link" data-ftype="cdn" data-fval="${{esc(r.cdn)}}" title="Filter: ${{esc(r.cdn)}}">${{esc(r.cdn)}}</span>`:'—'}}</td>
       <td class="cell-center">${{secHtml(r.sec_score,r.sec_detail)}}</td>
       <td class="cell-center">${{r.redirect_count?`<span class="redir-chip" title="${{esc(chain)}}">${{r.redirect_count}}x</span>`:'—'}}</td>
-      <td class="cell-ip" title="${{esc(r.reverse_dns||'')}}">${{esc(r.ip||'—')}}</td>
-      <td class="cell-asn" title="${{esc(r.asn_name||'')}}">${{esc(r.asn||'—')}}</td>
+      <td class="cell-ip"><span class="${{r.ip?'filter-link':''}}" data-ftype="ip" data-fval="${{esc(r.ip||'')}}" title="${{esc(r.reverse_dns||'')}}${{r.ip?' → Filter: '+esc(r.ip):''}}">${{esc(r.ip||'—')}}</span></td>
+      <td class="cell-asn"><span class="${{r.asn?'filter-link':''}}" data-ftype="asn" data-fval="${{esc(r.asn||'')}}" title="${{esc(r.asn_name||'')}}${{r.asn?' → Filter: '+esc(r.asn):''}}">${{esc(r.asn||'—')}}</span></td>
       <td class="cell-ns">${{esc((r.nameservers||'—').substring(0,50))}}</td>
       <td>${{esc((r.title||'—').substring(0,50))}}</td>
       <td class="cell-url"><a href="${{esc(r.final_url)}}" target="_blank">${{esc((r.final_url||'—').substring(0,55))}}</a></td>
@@ -1391,6 +1432,22 @@ function doSort(col) {{
   if (sortCol===col) sortAsc=!sortAsc; else {{sortCol=col; sortAsc=true;}}
   applyFilters();
 }}
+
+// ── Click handler for filter links ──
+document.addEventListener('click', function(e) {{
+  const el = e.target.closest('.filter-link[data-ftype]');
+  if (!el) return;
+  const type = el.dataset.ftype;
+  const val  = el.dataset.fval;
+  if (!val || val === '—') return;
+  e.stopPropagation();
+  // Toggle: clicking the same filter again clears it
+  if (hostFilter && hostFilter.type===type && hostFilter.value===val) {{
+    clearHostFilter();
+  }} else {{
+    setHostFilter(type, val);
+  }}
+}});
 
 render();
 </script>
