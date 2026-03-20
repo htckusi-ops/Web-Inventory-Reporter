@@ -1657,6 +1657,14 @@ def main(input_file):
 
     save_results_json(results)
 
+    # Sanitize surrogate characters that some pages produce (broken encodings).
+    # Python's UTF-8 codec refuses to write them — replace with U+FFFD (replacement char).
+    def _clean(v):
+        return v.encode("utf-8", errors="replace").decode("utf-8") if isinstance(v, str) else v
+    for r in results:
+        for k in list(r.keys()):
+            r[k] = _clean(r[k])
+
     print(f"\n{'─'*50}")
     print(f"Reports für {len(results)} Hosts ...")
     write_csv(results)
