@@ -1,5 +1,6 @@
 import configparser
 import csv
+import subprocess
 import sys
 import re
 import base64
@@ -190,6 +191,34 @@ def get_ssl_info(host):
         return ""
 
 
+def get_ip_info(host: str) -> tuple:
+    """Return (ip_address, reverse_dns_hostname)."""
+    try:
+        ip = socket.gethostbyname(host)
+    except Exception:
+        return "", ""
+    try:
+        reverse = socket.gethostbyaddr(ip)[0]
+    except Exception:
+        reverse = ""
+    return ip, reverse
+
+
+def get_nameservers(host: str) -> str:
+    """Return comma-separated authoritative nameservers for the domain."""
+    parts = host.split(".")
+    domain = ".".join(parts[-2:]) if len(parts) >= 2 else host
+    try:
+        result = subprocess.run(
+            ["dig", "NS", domain, "+short", "+time=3", "+tries=1"],
+            capture_output=True, text=True, timeout=5,
+        )
+        ns_list = sorted({l.strip().rstrip(".") for l in result.stdout.splitlines() if l.strip()})
+        return ", ".join(ns_list[:6])
+    except Exception:
+        return ""
+
+
 def get_ssl_info_insecure(host):
     """Get SSL cert expiry even for invalid/expired certs (no validation)."""
     try:
@@ -246,6 +275,29 @@ def _do_scan(page, url, host):
         thumb_path      = THUMB_DIR      / f"{filename}.jpg"
         if SCREENSHOT_DELAY > 0:
             page.wait_for_timeout(SCREENSHOT_DELAY)
+        # Hide common cookie/GDPR consent overlays before screenshot
+        try:
+            page.evaluate("""(() => {
+                const s = document.createElement('style');
+                s.textContent = [
+                    '#onetrust-banner-sdk','#onetrust-consent-sdk',
+                    '#CybotCookiebotDialog','#CookiebotWidget',
+                    '.cc-window','.cc-banner','.cc-float',
+                    '#cookie-notice','.cookie-notice',
+                    '#cookie-banner','.cookie-banner',
+                    '#cookieConsent','.cookieConsent',
+                    '#cookie-law-info-bar','.cookies-eu-banner',
+                    '#gdpr-banner','.gdpr-banner',
+                    '.cookiebanner','.cookie-warning',
+                    '[id^="cookie-consent"]','[class^="cookie-consent"]',
+                    '.pea_cook_wrapper','#tarteaucitron',
+                ].join(',') + '{display:none!important}' +
+                'body{overflow:auto!important}';
+                document.head.appendChild(s);
+            })()""")
+            page.wait_for_timeout(150)
+        except Exception:
+            pass
         page.screenshot(path=str(screenshot_path), full_page=False)
         create_thumbnail_16_10(screenshot_path, thumb_path)
 
@@ -280,6 +332,9 @@ def scan_host(page, browser, host):
     urls = [f"https://{host}", f"http://{host}"]
     last_error = ""
 
+    ip, reverse_dns = get_ip_info(host)
+    nameservers = get_nameservers(host)
+
     for url in urls:
         # ── Normal attempt (strict SSL) ───────────────────────────────────
         try:
@@ -288,6 +343,7 @@ def scan_host(page, browser, host):
             return {
                 "host": host, **info,
                 "ssl_expiry": ssl_expiry, "error": "",
+                "ip": ip, "reverse_dns": reverse_dns, "nameservers": nameservers,
             }
         except Exception as e:
             err_str = str(e)
@@ -309,6 +365,7 @@ def scan_host(page, browser, host):
                             "host": host, **info,
                             "ssl_expiry": ssl_expiry,
                             "error": err_str,
+                            "ip": ip, "reverse_dns": reverse_dns, "nameservers": nameservers,
                         }
                     finally:
                         ctx.close()
@@ -321,6 +378,7 @@ def scan_host(page, browser, host):
         "load_time": "", "ssl_expiry": "", "screenshot": "", "thumbnail": "",
         "security_headers": {"_score": 0}, "redirect_chain": [], "cms": "",
         "error": last_error,
+        "ip": ip, "reverse_dns": reverse_dns, "nameservers": nameservers,
     }
 
 
@@ -368,13 +426,17 @@ def _sec_score(row: dict) -> int:
 
 def write_csv(data):
     fieldnames = [
-        "host", "status", "final_url", "title", "load_time", "ssl_expiry",
-        "cms", "sec_score", "redirects", "redirect_chain", "delta", "error",
+        "host", "ip", "reverse_dns", "nameservers", "status", "final_url",
+        "title", "load_time", "ssl_expiry", "cms", "sec_score",
+        "redirects", "redirect_chain", "delta", "error",
     ]
     rows = []
     for r in data:
         rows.append({
             "host":           r["host"],
+            "ip":             r.get("ip", ""),
+            "reverse_dns":    r.get("reverse_dns", ""),
+            "nameservers":    r.get("nameservers", ""),
             "status":         r.get("status", ""),
             "final_url":      r.get("final_url", ""),
             "title":          r.get("title", ""),
@@ -577,9 +639,11 @@ def write_excel(data):
     ws = wb.create_sheet(_t["sheet_inventory"])
 
     # Col: Host Status Ladezeit SSL-bis CMS Sec Redirects FinalURL Titel Delta Fehler Preview
-    headers    = ["Host", "Status", "Ladezeit (s)", "SSL gültig bis",
+    headers    = ["Host", "IP-Adresse", "Reverse DNS", "Nameserver",
+                  "Status", "Ladezeit (s)", "SSL gültig bis",
                   "CMS", "Sec.", "Redirects", "Final URL", "Titel", "Delta", "Fehler", "Preview"]
-    col_widths = [28,     10,      14,           16,
+    col_widths = [28,     16,          22,            32,
+                  10,     14,           16,
                   14,     8,       12,           40,         30,     10,     30,        28    ]
 
     for j, h in enumerate(headers, 1):
@@ -603,7 +667,8 @@ def write_excel(data):
         delta_val = row.get("delta", "")
 
         vals = [
-            row["host"], row.get("status", ""), row.get("load_time", ""), row.get("ssl_expiry", ""),
+            row["host"], row.get("ip", ""), row.get("reverse_dns", ""), row.get("nameservers", ""),
+            row.get("status", ""), row.get("load_time", ""), row.get("ssl_expiry", ""),
             row.get("cms", "") or "—", sec_val, redir_val,
             row.get("final_url", ""), row.get("title", ""), delta_val,
             row.get("error", ""), "",
@@ -612,16 +677,17 @@ def write_excel(data):
         for j, val in enumerate(vals, 1):
             c = ws.cell(row=i, column=j, value=val)
             c.font, c.fill, c.border = cell_font, fill, border
-            c.alignment = center_align if j in (2, 3, 4, 6, 7, 10) else cell_align
+            # center: Status(5), Ladezeit(6), SSL(7), Sec(9), Redirects(10), Delta(13)
+            c.alignment = center_align if j in (5, 6, 7, 9, 10, 13) else cell_align
 
-            if j == 2 and val:
+            if j == 5 and val:  # Status
                 s = int(val) if str(val).isdigit() else 0
                 c.font = font_ok if 200 <= s < 300 else (font_redir if 300 <= s < 400 else font_err)
-            elif j == 6:  # Sec score
+            elif j == 9:  # Sec score
                 score = _sec_score(row)
                 c.font = Font(name="Arial", size=10, bold=True,
                               color="198754" if score >= 6 else ("856404" if score >= 4 else SRG_RED))
-            elif j == 10 and val:  # Delta
+            elif j == 13 and val:  # Delta
                 col = _delta_colors.get(val, SRG_GRAY)
                 c.font = Font(name="Arial", size=10, bold=True, color=col)
 
@@ -635,8 +701,8 @@ def write_excel(data):
 
         ws.row_dimensions[i].height = 80
 
-    # Conditional formatting: Ladezeit (column C)
-    lt_range = f"C2:C{len(data)+1}"
+    # Conditional formatting: Ladezeit (now column F, index 6)
+    lt_range = f"F2:F{len(data)+1}"
     ws.conditional_formatting.add(lt_range, CellIsRule(
         operator="greaterThan", formula=["3"],
         fill=PatternFill("solid", fgColor="fde8e8"),
@@ -713,6 +779,9 @@ def write_html(data):
             "redirect_count": len(chain),
             "redirect_chain": [f'{r["url"]} ({r["status"]})' for r in chain],
             "delta":     row.get("delta", ""),
+            "ip":        row.get("ip", ""),
+            "reverse_dns": row.get("reverse_dns", ""),
+            "nameservers": row.get("nameservers", ""),
         })
 
     data_json = json.dumps(json_data, ensure_ascii=False).replace('</', '<\\/')
@@ -765,9 +834,9 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,
 .filter-select {{ padding:0.4rem 0.6rem; border:1px solid var(--srg-border); border-radius:var(--r); font-size:0.82rem; font-family:inherit; background:var(--srg-white); }}
 
 .cards {{ display:grid; grid-template-columns:repeat(auto-fill,minmax({CARD_WIDTH}px,1fr)); gap:1rem; padding:0.8rem 2.5rem 1rem; }}
-.card {{ background:var(--srg-white); border-radius:var(--r); overflow:hidden; border:1px solid var(--srg-border); transition:box-shadow 0.2s,transform 0.15s; }}
+.card {{ background:var(--srg-white); border-radius:var(--r); overflow:visible; border:1px solid var(--srg-border); transition:box-shadow 0.2s,transform 0.15s; position:relative; }}
 .card:hover {{ box-shadow:0 4px 16px rgba(0,0,0,0.07); transform:translateY(-1px); }}
-.card-image {{ background:#eaeaea; aspect-ratio:16/10; overflow:hidden; display:flex; align-items:flex-start; }}
+.card-image {{ background:#eaeaea; aspect-ratio:16/10; overflow:hidden; display:flex; align-items:flex-start; border-radius:var(--r) var(--r) 0 0; }}
 .card-image img {{ width:100%; height:100%; object-fit:cover; object-position:top; }}
 .no-preview {{ display:flex; align-items:center; justify-content:center; width:100%; color:var(--srg-gray-light); font-size:0.85rem; }}
 .card-body {{ padding:0.7rem 1rem 0.8rem; }}
@@ -777,7 +846,11 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,
 .card-url {{ font-size:0.75rem; color:var(--srg-red); text-decoration:none; word-break:break-all; }}
 .card-url:hover {{ text-decoration:underline; }}
 .card-ssl {{ font-size:0.72rem; color:var(--srg-green); }}
+.card-ip {{ font-size:0.72rem; color:var(--srg-gray-light); margin-top:0.2rem; display:inline-block; cursor:default; }}
+.card-ns {{ font-size:0.7rem; color:var(--srg-gray-light); display:inline-block; }}
 .card-error {{ margin-top:0.4rem; padding:0.3rem 0.5rem; background:#fde8e8; border-radius:4px; font-size:0.72rem; color:var(--srg-red); }}
+.cell-ip {{ font-size:0.78rem; font-family:monospace; white-space:nowrap; }}
+.cell-ns {{ font-size:0.75rem; color:var(--srg-gray-light); }}
 
 .badge {{ display:inline-block; padding:0.1rem 0.45rem; border-radius:4px; font-size:0.72rem; font-weight:600; white-space:nowrap; }}
 .badge-ok {{ background:var(--srg-green-bg); color:var(--srg-green); }}
@@ -796,7 +869,7 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,
 .redir-chip {{ font-size:0.7rem; color:#6c757d; cursor:help; }}
 .sec-tooltip {{ position:relative; cursor:help; }}
 .sec-tooltip:hover .sec-tip {{ display:block; }}
-.sec-tip {{ display:none; position:absolute; z-index:99; bottom:120%; left:50%; transform:translateX(-50%); background:#333; color:#fff; font-size:0.7rem; padding:0.4rem 0.6rem; border-radius:4px; white-space:nowrap; min-width:180px; line-height:1.6; }}
+.sec-tip {{ display:none; position:absolute; z-index:1000; bottom:120%; left:50%; transform:translateX(-50%); background:#333; color:#fff; font-size:0.7rem; padding:0.4rem 0.6rem; border-radius:4px; white-space:nowrap; min-width:180px; line-height:1.6; }}
 .sec-tip::after {{ content:""; position:absolute; top:100%; left:50%; transform:translateX(-50%); border:5px solid transparent; border-top-color:#333; }}
 
 .lt {{ font-size:0.72rem; font-weight:500; }}
@@ -991,12 +1064,15 @@ function render() {{
     const redir = redirHtml(r.redirect_count, r.redirect_chain);
     const delta = deltaHtml(r.delta);
     const err   = r.error ? `<div class="card-error">${{esc(r.error.substring(0,120))}}</div>` : '';
+    const ipHtml = r.ip ? `<span class="card-ip" title="${{esc(r.reverse_dns||r.ip)}}">🖥 ${{esc(r.ip)}}</span>` : '';
+    const nsHtml = r.nameservers ? `<span class="card-ns" title="Nameserver">🌐 ${{esc(r.nameservers)}}</span>` : '';
     return `<div class="card"><div class="card-image">${{img}}</div><div class="card-body">
       <h3 class="card-title">${{esc(r.host)}} ${{delta}}</h3>
       <div class="card-meta">${{badge(r.status)}} ${{ltHtml(r.load_time)}} ${{ssl}} ${{redir}}</div>
       <div class="card-meta">${{cms}} ${{sec}}</div>
       <div class="card-pagetitle">${{esc((r.title||'—').substring(0,60))}}</div>
       <a class="card-url" href="${{esc(r.final_url)}}" target="_blank" rel="noopener">${{esc((r.final_url||'—').substring(0,70))}}</a>
+      ${{ipHtml}}${{nsHtml ? '<br>' + nsHtml : ''}}
       ${{err}}</div></div>`;
   }}).join('');
 
@@ -1005,6 +1081,7 @@ function render() {{
     ['thumb','Preview',false],['host','Host',true],['status','Status',true],
     ['load_time','Ladezeit',true],['ssl_expiry','SSL bis',true],['cms','CMS',true],
     ['sec_score','Sec.',true],['redirect_count','Redir.',true],
+    ['ip','IP',true],['nameservers','Nameserver',true],
     ['title','Titel',true],['final_url','URL',true],['delta','Delta',true],['error','Fehler',true]
   ];
   document.getElementById('table-head').innerHTML = cols.map(([key,label,sortable]) => {{
@@ -1027,6 +1104,8 @@ function render() {{
       <td class="cell-center">${{r.cms?`<span class="badge badge-cms">${{esc(r.cms)}}</span>`:'—'}}</td>
       <td class="cell-center">${{secHtml(r.sec_score,r.sec_detail)}}</td>
       <td class="cell-center">${{r.redirect_count?`<span class="redir-chip" title="${{esc(chain)}}">${{r.redirect_count}}x</span>`:'—'}}</td>
+      <td class="cell-ip" title="${{esc(r.reverse_dns||'')}}">${{esc(r.ip||'—')}}</td>
+      <td class="cell-ns">${{esc((r.nameservers||'—').substring(0,50))}}</td>
       <td>${{esc((r.title||'—').substring(0,50))}}</td>
       <td class="cell-url"><a href="${{esc(r.final_url)}}" target="_blank">${{esc((r.final_url||'—').substring(0,55))}}</a></td>
       <td class="cell-center">${{deltaHtml(r.delta)}}</td>
