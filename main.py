@@ -468,6 +468,22 @@ def _do_scan(page, url, host):
             html_content = ""
         cms = detect_cms(html_content, resp_headers)
 
+        # ── Cert info via Playwright security_details (reuses existing TLS conn) ──
+        cert_expiry = ""
+        cert_subject_cn = ""
+        try:
+            sd = response.security_details() if response else None
+            if sd:
+                vt = sd.get("valid_to")
+                if vt:
+                    from datetime import timezone
+                    cert_expiry = datetime.fromtimestamp(
+                        vt, tz=timezone.utc
+                    ).strftime("%d.%m.%Y")
+                cert_subject_cn = sd.get("subject_name", "")
+        except Exception:
+            pass
+
         return {
             "status":           response.status if response else "",
             "final_url":        final_url,
@@ -479,6 +495,8 @@ def _do_scan(page, url, host):
             "redirect_chain":   redirect_chain,
             "cms":              cms,
             "cdn":              cdn,
+            "ssl_expiry":       cert_expiry,
+            "cert_subject_cn":  cert_subject_cn,
         }
     finally:
         page.remove_listener("response", on_response)
@@ -492,15 +510,18 @@ def scan_host(page, browser, host):
     nameservers = get_nameservers(host)
 
     # Parallel background lookups while browser scan runs
-    cert_result  = [{"expiry": "", "subject_cn": "", "san": []}]
+    # get_cert_info → SAN only (expiry+subject come from Playwright security_details)
+    san_result   = [{"san": []}]
     asn_result   = [{"asn": "", "asn_name": "", "network": "", "country": ""}]
     whois_result = [{"registrar": "", "domain_expiry": ""}]
 
-    def _cert():  cert_result[0]  = get_cert_info(host)
+    def _san():
+        c = get_cert_info(host)
+        san_result[0]["san"] = c["san"]
     def _asn():   asn_result[0]   = get_asn_info(ip)
     def _whois(): whois_result[0] = get_whois_info(host)
 
-    bg = [threading.Thread(target=f, daemon=True) for f in (_cert, _asn, _whois)]
+    bg = [threading.Thread(target=f, daemon=True) for f in (_san, _asn, _whois)]
     for t in bg:
         t.start()
 
@@ -542,17 +563,21 @@ def scan_host(page, browser, host):
     for t in bg:
         t.join(timeout=15)
 
-    cert  = cert_result[0]
     asn   = asn_result[0]
     whois = whois_result[0]
+
+    # ssl_expiry + cert_subject_cn come from Playwright (_do_scan); SAN from background
+    browser_ssl_expiry    = (scan_result or {}).get("ssl_expiry", "")
+    browser_cert_subject  = (scan_result or {}).get("cert_subject_cn", "")
+    cert_san_str          = ", ".join(san_result[0]["san"][:10])
 
     extra = {
         "ip":             ip,
         "reverse_dns":    reverse_dns,
         "nameservers":    nameservers,
-        "ssl_expiry":     cert["expiry"],
-        "cert_subject_cn": cert["subject_cn"],
-        "cert_san":       ", ".join(cert["san"][:10]),
+        "ssl_expiry":     browser_ssl_expiry,
+        "cert_subject_cn": browser_cert_subject,
+        "cert_san":       cert_san_str,
         "asn":            asn["asn"],
         "asn_name":       asn["asn_name"],
         "hosting_country": asn["country"],
@@ -852,22 +877,24 @@ def write_excel(data):
 
     # Col: Host IP RevDNS NS ASN Provider Country ScanState Status Ladezeit SSL CertSubj CertSAN CMS CDN Sec Redir Registrar DomainExp FinalURL Titel Delta Fehler ScanTime Preview
     headers    = [
+        "Preview",
         "Host", "IP-Adresse", "Reverse DNS", "Nameserver",
         "ASN", "Provider", "Land",
         "Scan State", "Status", "Ladezeit (s)", "SSL gültig bis",
         "Cert Subject", "Cert SAN",
         "CMS", "CDN", "Sec.", "Redirects",
         "Registrar", "Domain-Ablauf",
-        "Final URL", "Titel", "Delta", "Fehler", "Scan-Zeit", "Preview",
+        "Final URL", "Titel", "Delta", "Fehler", "Scan-Zeit",
     ]
     col_widths = [
+        28,
         28, 16, 22, 32,
         12, 24, 8,
         14, 10, 14, 16,
         24, 30,
         14, 14, 8, 12,
         24, 16,
-        40, 30, 10, 30, 20, 28,
+        40, 30, 10, 30, 20,
     ]
 
     for j, h in enumerate(headers, 1):
@@ -882,7 +909,7 @@ def write_excel(data):
     ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(data)+1}"
 
     _delta_colors = {"new": "198754", "changed": "856404", "unchanged": SRG_GRAY}
-    _preview_col  = len(headers)  # last column = Preview
+    _preview_col  = 1  # first column = Preview (col A)
 
     for i, row in enumerate(data, start=2):
         fill     = zebra if i % 2 == 0 else white
@@ -891,6 +918,7 @@ def write_excel(data):
         delta_val = row.get("delta", "")
 
         vals = [
+            "",  # col 1 = Preview (image inserted separately below)
             row["host"], row.get("ip", ""), row.get("reverse_dns", ""), row.get("nameservers", ""),
             row.get("asn", ""), row.get("asn_name", ""), row.get("hosting_country", ""),
             row.get("scan_state", ""),
@@ -900,28 +928,28 @@ def write_excel(data):
             sec_val, redir_val,
             row.get("registrar", ""), row.get("domain_expiry", ""),
             row.get("final_url", ""), row.get("title", ""), delta_val,
-            row.get("error", ""), row.get("scan_time", ""), "",
+            row.get("error", ""), row.get("scan_time", ""),
         ]
         # Column indices (1-based):
-        # 1=Host 2=IP 3=RevDNS 4=NS 5=ASN 6=Provider 7=Country
-        # 8=ScanState 9=Status 10=Ladezeit 11=SSL 12=CertSubj 13=CertSAN
-        # 14=CMS 15=CDN 16=Sec 17=Redir 18=Registrar 19=DomainExp
-        # 20=FinalURL 21=Titel 22=Delta 23=Fehler 24=ScanTime 25=Preview
+        # 1=Preview 2=Host 3=IP 4=RevDNS 5=NS 6=ASN 7=Provider 8=Country
+        # 9=ScanState 10=Status 11=Ladezeit 12=SSL 13=CertSubj 14=CertSAN
+        # 15=CMS 16=CDN 17=Sec 18=Redir 19=Registrar 20=DomainExp
+        # 21=FinalURL 22=Titel 23=Delta 24=Fehler 25=ScanTime
 
         for j, val in enumerate(vals, 1):
             c = ws.cell(row=i, column=j, value=val)
             c.font, c.fill, c.border = cell_font, fill, border
-            # center: ScanState(8), Status(9), Ladezeit(10), SSL(11), Sec(16), Redir(17), Delta(22), ScanTime(24)
-            c.alignment = center_align if j in (8, 9, 10, 11, 16, 17, 22, 24) else cell_align
+            # center: ScanState(9), Status(10), Ladezeit(11), SSL(12), Sec(17), Redir(18), Delta(23), ScanTime(25)
+            c.alignment = center_align if j in (9, 10, 11, 12, 17, 18, 23, 25) else cell_align
 
-            if j == 9 and val:  # Status
+            if j == 10 and val:  # Status
                 s = int(val) if str(val).isdigit() else 0
                 c.font = font_ok if 200 <= s < 300 else (font_redir if 300 <= s < 400 else font_err)
-            elif j == 16:  # Sec score
+            elif j == 17:  # Sec score
                 score = _sec_score(row)
                 c.font = Font(name="Arial", size=10, bold=True,
                               color="198754" if score >= 6 else ("856404" if score >= 4 else SRG_RED))
-            elif j == 22 and val:  # Delta
+            elif j == 23 and val:  # Delta
                 col = _delta_colors.get(val, SRG_GRAY)
                 c.font = Font(name="Arial", size=10, bold=True, color=col)
 
@@ -935,8 +963,8 @@ def write_excel(data):
 
         ws.row_dimensions[i].height = 80
 
-    # Conditional formatting: Ladezeit (now column J, index 10)
-    lt_range = f"J2:J{len(data)+1}"
+    # Conditional formatting: Ladezeit (now column K, index 11)
+    lt_range = f"K2:K{len(data)+1}"
     ws.conditional_formatting.add(lt_range, CellIsRule(
         operator="greaterThan", formula=["3"],
         fill=PatternFill("solid", fgColor="fde8e8"),
@@ -1098,7 +1126,9 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,
 .filter-link {{ cursor:pointer; border-radius:3px; }}
 .filter-link:hover {{ opacity:0.7; text-decoration:underline; outline:1px dashed currentColor; }}
 .filter-active-bar {{ display:flex; align-items:center; gap:0.6rem; padding:0.45rem 2.5rem; background:var(--srg-yellow-bg); border-bottom:1px solid #ffe69c; font-size:0.82rem; color:var(--srg-yellow); }}
-.filter-active-bar .f-tag {{ background:var(--srg-yellow); color:#fff; padding:0.15rem 0.55rem; border-radius:4px; font-weight:700; font-size:0.78rem; }}
+.filter-active-bar .f-tag {{ background:var(--srg-yellow); color:#fff; padding:0.15rem 0.55rem; border-radius:4px; font-weight:700; font-size:0.78rem; display:inline-flex; align-items:center; gap:3px; }}
+.filter-active-bar .f-x {{ cursor:pointer; opacity:0.75; font-weight:400; font-size:0.9em; }}
+.filter-active-bar .f-x:hover {{ opacity:1; }}
 .filter-active-bar button {{ padding:0.15rem 0.6rem; border:1px solid var(--srg-yellow); border-radius:4px; background:transparent; color:var(--srg-yellow); cursor:pointer; font-size:0.78rem; font-family:inherit; }}
 .filter-active-bar button:hover {{ background:var(--srg-yellow); color:#fff; }}
 .card-error {{ margin-top:0.4rem; padding:0.3rem 0.5rem; background:#fde8e8; border-radius:4px; font-size:0.72rem; color:var(--srg-red); }}
@@ -1205,9 +1235,9 @@ tbody td {{ padding:0.45rem 0.7rem; vertical-align:middle; border-bottom:1px sol
 </div>
 
 <div id="host-filter-bar" style="display:none" class="filter-active-bar">
-    <span class="f-tag" id="host-filter-label"></span>
-    <span id="host-filter-count"></span>
-    <button onclick="clearHostFilter()">✕ Filter aufheben</button>
+    <span id="host-filter-chips"></span>
+    <span id="host-filter-count" style="font-size:0.8rem;opacity:0.8;"></span>
+    <button onclick="clearHostFilter()">✕ Alle aufheben</button>
 </div>
 
 <div class="cards-wrap active" id="cards-wrap"><div class="cards" id="cards-container"></div></div>
@@ -1232,7 +1262,7 @@ let filtered = [...ALL_DATA];
 let sortCol = null, sortAsc = true;
 let page = 1;
 let searchTerm = '', statusFilter = 'all', cmsFilter = 'all';
-let hostFilter = null; // {{type:'ip'|'ns'|'cdn'|'asn', value:'...'}}
+let hostFilters = {{}}; // map type → value, e.g. {{'ip':'1.2.3.4','cdn':'Cloudflare'}}
 
 // Populate CMS filter
 (function() {{
@@ -1280,15 +1310,16 @@ function applyFilters() {{
     }});
   }}
   if (cmsFilter !== 'all') d = d.filter(r => r.cms === cmsFilter);
-  if (hostFilter) {{
+  // Apply each active host filter (AND-logic across types)
+  Object.entries(hostFilters).forEach(([type, val]) => {{
     d = d.filter(r => {{
-      if (hostFilter.type==='ip')  return r.ip === hostFilter.value;
-      if (hostFilter.type==='ns')  return (r.nameservers||'').split(',').map(s=>s.trim()).includes(hostFilter.value);
-      if (hostFilter.type==='cdn') return r.cdn === hostFilter.value;
-      if (hostFilter.type==='asn') return r.asn === hostFilter.value;
+      if (type==='ip')  return r.ip === val;
+      if (type==='ns')  return (r.nameservers||'').split(',').map(s=>s.trim()).includes(val);
+      if (type==='cdn') return r.cdn === val;
+      if (type==='asn') return r.asn === val;
       return true;
     }});
-  }}
+  }});
   if (searchTerm) {{
     const q=searchTerm.toLowerCase();
     d = d.filter(r => (r.host+' '+r.title+' '+r.final_url+' '+r.error+' '+r.cms+' '+r.cdn+' '+r.asn+' '+(r.asn_name||'')+' '+(r.scan_state||'')).toLowerCase().includes(q));
@@ -1304,12 +1335,15 @@ function applyFilters() {{
     }});
   }}
   filtered=d; page=1;
-  // Update filter bar
+  // ── Update filter bar ──
   const bar=document.getElementById('host-filter-bar');
-  if (hostFilter) {{
-    const labels={{'ip':'🖥 IP','ns':'🌐 Nameserver','cdn':'CDN','asn':'🏢 ASN'}};
-    document.getElementById('host-filter-label').textContent=`${{labels[hostFilter.type]||hostFilter.type}}: ${{hostFilter.value}}`;
-    document.getElementById('host-filter-count').textContent=`(${{d.length}} Host${{d.length!==1?'s':''}})`;
+  const _af=Object.entries(hostFilters);
+  if (_af.length > 0) {{
+    const _lbl={{'ip':'\uD83D\uDDA5 IP','ns':'\uD83C\uDF10 NS','cdn':'CDN','asn':'\uD83C\uDFE2 ASN'}};
+    document.getElementById('host-filter-chips').innerHTML = _af.map(([t,v]) =>
+      `<span class="f-tag">${{_lbl[t]||t}}: ${{v}}\u2009<span class="f-x" data-clear="${{t}}" title="Filter entfernen">\u00D7</span></span>`
+    ).join('\u2002');
+    document.getElementById('host-filter-count').textContent = '\u2014 '+d.length+' Treffer';
     bar.style.display='flex';
   }} else {{
     bar.style.display='none';
@@ -1318,11 +1352,15 @@ function applyFilters() {{
 }}
 
 function setHostFilter(type, value) {{
-  hostFilter = {{type, value}};
+  hostFilters[type] = value;
+  applyFilters();
+}}
+function clearOneFilter(type) {{
+  delete hostFilters[type];
   applyFilters();
 }}
 function clearHostFilter() {{
-  hostFilter = null;
+  hostFilters = {{}};
   applyFilters();
 }}
 
@@ -1433,17 +1471,21 @@ function doSort(col) {{
   applyFilters();
 }}
 
-// ── Click handler for filter links ──
+// ── Click handlers for filter links and × chips ──
 document.addEventListener('click', function(e) {{
+  // Remove single filter via × chip
+  const cx = e.target.closest('.f-x[data-clear]');
+  if (cx) {{ e.stopPropagation(); clearOneFilter(cx.dataset.clear); return; }}
+  // Set / toggle a host filter
   const el = e.target.closest('.filter-link[data-ftype]');
   if (!el) return;
   const type = el.dataset.ftype;
   const val  = el.dataset.fval;
   if (!val || val === '—') return;
   e.stopPropagation();
-  // Toggle: clicking the same filter again clears it
-  if (hostFilter && hostFilter.type===type && hostFilter.value===val) {{
-    clearHostFilter();
+  // Toggle: clicking the active value of the same type removes just that type
+  if (hostFilters[type] === val) {{
+    clearOneFilter(type);
   }} else {{
     setHostFilter(type, val);
   }}
