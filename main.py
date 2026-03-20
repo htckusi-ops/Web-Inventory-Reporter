@@ -128,10 +128,70 @@ def detect_cms(html: str, headers: dict) -> str:
     return ""
 
 
+# ── CDN / Hosting detection signatures ───────────────────────────────────────
+_CDN_HEADER_SIGS = [
+    ("Cloudflare",  {"cf-ray", "cf-cache-status"}),
+    ("CloudFront",  {"x-amz-cf-id", "x-amz-cf-pop"}),
+    ("Fastly",      {"x-fastly-request-id", "fastly-restarts", "x-served-by"}),
+    ("Akamai",      {"x-akamai-transformed", "x-check-cacheable", "akamai-origin-hop"}),
+    ("Vercel",      {"x-vercel-id", "x-vercel-cache"}),
+    ("Netlify",     {"x-nf-request-id"}),
+    ("BunnyCDN",    {"cdn-pullzone", "cdn-uid"}),
+    ("Sucuri",      {"x-sucuri-id", "x-sucuri-cache"}),
+    ("Azure CDN",   {"x-azure-ref"}),
+    ("Imperva",     {"x-iinfo"}),
+]
+_CDN_SERVER_SIGS = [
+    ("Cloudflare", "cloudflare"),
+    ("Vercel",     "vercel"),
+    ("Netlify",    "netlify"),
+    ("KeyCDN",     "keycdn"),
+    ("Akamai",     "akamaighost"),
+    ("Google CDN", "gws"),
+]
+
+
+def detect_cdn(headers: dict) -> str:
+    """Detect CDN/hosting from HTTP response headers."""
+    srv = headers.get("server", "").lower()
+    for name, sig in _CDN_SERVER_SIGS:
+        if sig in srv:
+            return name
+    for name, header_set in _CDN_HEADER_SIGS:
+        if any(h in headers for h in header_set):
+            return name
+    via = headers.get("via", "").lower()
+    if "cloudfront" in via:
+        return "CloudFront"
+    return ""
+
+
 def check_security_headers(headers: dict) -> dict:
     result = {h: headers.get(h, "") for h in SEC_HEADERS}
     result["_score"] = sum(1 for h in SEC_HEADERS if headers.get(h))
     return result
+
+
+def classify_error(error_str: str, status) -> str:
+    """Return a machine-readable scan_state string."""
+    if not error_str:
+        s = str(status) if status else ""
+        return "ok" if s[:1] in ("2", "3", "4", "5") else ("error" if not s else "ok")
+    e = error_str.lower()
+    if any(k in e for k in ["name_not_resolved", "err_name_not_resolved",
+                              "getaddrinfo failed", "nodename nor servname",
+                              "no address associated", "dns_probe"]):
+        return "dns_failed"
+    if any(k in e for k in ["err_cert", "err_ssl", "err_tls", "certificate",
+                              "sec_error_", "mozilla_pkix_error_", "tls_"]):
+        return "tls_failed"
+    if any(k in e for k in ["timeout", "timed out", "err_timed_out"]):
+        return "timeout"
+    if any(k in e for k in ["connection refused", "err_connection_refused", "econnrefused"]):
+        return "connection_refused"
+    if any(k in e for k in ["err_blocked", "access denied", "403 forbidden"]):
+        return "blocked"
+    return "error"
 
 
 def log(msg):
@@ -178,17 +238,71 @@ def image_to_base64(path):
         return ""
 
 
-def get_ssl_info(host):
+def get_cert_info(host: str) -> dict:
+    """Get SSL cert info: expiry, subject_cn, san list. Tries strict then insecure."""
+    result = {"expiry": "", "subject_cn": "", "san": []}
+
+    def _parse(cert: dict):
+        if not cert:
+            return
+        try:
+            result["expiry"] = datetime.strptime(
+                cert["notAfter"], "%b %d %H:%M:%S %Y %Z"
+            ).strftime("%d.%m.%Y")
+        except Exception:
+            pass
+        for rdns in cert.get("subject", ()):
+            for k, v in rdns:
+                if k == "commonName":
+                    result["subject_cn"] = v
+        for typ, val in cert.get("subjectAltName", ()):
+            if typ == "DNS":
+                result["san"].append(val)
+
+    # Attempt 1: full TLS validation (returns complete cert dict for valid certs)
     try:
         ctx = ssl.create_default_context()
-        with ctx.wrap_socket(socket.socket(), server_hostname=host) as s:
-            s.settimeout(SSL_TIMEOUT)
-            s.connect((host, 443))
-            cert = s.getpeercertificate()
-            expiry = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
-            return expiry.strftime("%d.%m.%Y")
+        with socket.create_connection((host, 443), timeout=SSL_TIMEOUT) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as ss:
+                _parse(ss.getpeercertificate())
+        return result
     except Exception:
-        return ""
+        pass
+
+    # Attempt 2: no validation — get DER bytes and parse via openssl subprocess
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, 443), timeout=SSL_TIMEOUT) as raw:
+            with ctx.wrap_socket(raw, server_hostname=host) as ss:
+                der = ss.getpeercertificate(binary_form=True)
+        if der:
+            pem = ssl.DER_cert_to_PEM_cert(der)
+            proc = subprocess.run(
+                ["openssl", "x509", "-noout", "-subject", "-dates",
+                 "-ext", "subjectAltName", "-nameopt", "compat"],
+                input=pem, capture_output=True, text=True, timeout=5,
+            )
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("subject="):
+                    m = re.search(r"CN\s*=\s*([^,/\n]+)", line)
+                    if m:
+                        result["subject_cn"] = m.group(1).strip()
+                elif line.startswith("notAfter="):
+                    try:
+                        result["expiry"] = datetime.strptime(
+                            line.split("=", 1)[1].strip(), "%b %d %H:%M:%S %Y %Z"
+                        ).strftime("%d.%m.%Y")
+                    except Exception:
+                        pass
+                elif "DNS:" in line:
+                    result["san"].extend(re.findall(r"DNS:([^\s,]+)", line))
+    except Exception:
+        pass
+
+    return result
 
 
 def get_ip_info(host: str) -> tuple:
@@ -219,22 +333,62 @@ def get_nameservers(host: str) -> str:
         return ""
 
 
-def get_ssl_info_insecure(host):
-    """Get SSL cert expiry even for invalid/expired certs (no validation)."""
+def get_asn_info(ip: str) -> dict:
+    """Look up ASN / provider via Team Cymru DNS. Returns asn, asn_name, network, country."""
+    result = {"asn": "", "asn_name": "", "network": "", "country": ""}
+    if not ip:
+        return result
     try:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_OPTIONAL
-        with ctx.wrap_socket(socket.socket(), server_hostname=host) as s:
-            s.settimeout(SSL_TIMEOUT)
-            s.connect((host, 443))
-            cert = s.getpeercertificate()
-            if cert and "notAfter" in cert:
-                expiry = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
-                return expiry.strftime("%d.%m.%Y")
+        rev = ".".join(reversed(ip.split(".")))
+        out = subprocess.run(
+            ["dig", "TXT", f"{rev}.origin.asn.cymru.com", "+short", "+time=3", "+tries=1"],
+            capture_output=True, text=True, timeout=6,
+        ).stdout.strip().strip('"')
+        if out:
+            parts = [p.strip() for p in out.split("|")]
+            if len(parts) >= 3:
+                asn_num = parts[0].strip()
+                result["asn"] = f"AS{asn_num}"
+                result["network"] = parts[1].strip()
+                result["country"] = parts[2].strip()
+        # Second query: ASN name
+        if result["asn"]:
+            out2 = subprocess.run(
+                ["dig", "TXT", f"{result['asn']}.asn.cymru.com", "+short", "+time=3", "+tries=1"],
+                capture_output=True, text=True, timeout=6,
+            ).stdout.strip().strip('"')
+            if out2:
+                parts2 = [p.strip() for p in out2.split("|")]
+                if len(parts2) >= 5:
+                    result["asn_name"] = parts2[-1].strip().split(",")[0].strip()
     except Exception:
         pass
-    return ""
+    return result
+
+
+def get_whois_info(host: str) -> dict:
+    """Return registrar and domain expiry via python-whois. Capped at 10 s."""
+    result = {"registrar": "", "domain_expiry": ""}
+
+    def _query():
+        try:
+            import whois
+            parts = host.split(".")
+            domain = ".".join(parts[-2:]) if len(parts) >= 2 else host
+            w = whois.whois(domain)
+            result["registrar"] = str(w.registrar or "")[:60]
+            exp = w.expiration_date
+            if isinstance(exp, list):
+                exp = exp[0]
+            if exp and hasattr(exp, "strftime"):
+                result["domain_expiry"] = exp.strftime("%d.%m.%Y")
+        except Exception:
+            pass
+
+    t = threading.Thread(target=_query, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    return result
 
 
 # Error keywords that indicate a cert/SSL issue worth retrying with ignore_https_errors
@@ -306,6 +460,7 @@ def _do_scan(page, url, host):
             resp_headers = {k.lower(): v for k, v in response.headers.items()}
 
         sec_headers = check_security_headers(resp_headers)
+        cdn = detect_cdn(resp_headers)
 
         try:
             html_content = page.content()
@@ -323,28 +478,43 @@ def _do_scan(page, url, host):
             "security_headers": sec_headers,
             "redirect_chain":   redirect_chain,
             "cms":              cms,
+            "cdn":              cdn,
         }
     finally:
         page.remove_listener("response", on_response)
 
 
 def scan_host(page, browser, host):
-    urls = [f"https://{host}", f"http://{host}"]
-    last_error = ""
+    scan_time = datetime.now().isoformat()
 
+    # Sequential DNS lookups first (needed for ASN lookup)
     ip, reverse_dns = get_ip_info(host)
     nameservers = get_nameservers(host)
+
+    # Parallel background lookups while browser scan runs
+    cert_result  = [{"expiry": "", "subject_cn": "", "san": []}]
+    asn_result   = [{"asn": "", "asn_name": "", "network": "", "country": ""}]
+    whois_result = [{"registrar": "", "domain_expiry": ""}]
+
+    def _cert():  cert_result[0]  = get_cert_info(host)
+    def _asn():   asn_result[0]   = get_asn_info(ip)
+    def _whois(): whois_result[0] = get_whois_info(host)
+
+    bg = [threading.Thread(target=f, daemon=True) for f in (_cert, _asn, _whois)]
+    for t in bg:
+        t.start()
+
+    # Browser scan
+    urls = [f"https://{host}", f"http://{host}"]
+    last_error = ""
+    scan_result = None
 
     for url in urls:
         # ── Normal attempt (strict SSL) ───────────────────────────────────
         try:
             info = _do_scan(page, url, host)
-            ssl_expiry = get_ssl_info(host)
-            return {
-                "host": host, **info,
-                "ssl_expiry": ssl_expiry, "error": "",
-                "ip": ip, "reverse_dns": reverse_dns, "nameservers": nameservers,
-            }
+            scan_result = {"host": host, **info, "error": ""}
+            break
         except Exception as e:
             err_str = str(e)
             last_error = err_str
@@ -360,25 +530,52 @@ def scan_host(page, browser, host):
                     p2 = ctx.new_page()
                     try:
                         info = _do_scan(p2, url, host)
-                        ssl_expiry = get_ssl_info_insecure(host)
-                        return {
-                            "host": host, **info,
-                            "ssl_expiry": ssl_expiry,
-                            "error": err_str,
-                            "ip": ip, "reverse_dns": reverse_dns, "nameservers": nameservers,
-                        }
+                        scan_result = {"host": host, **info, "error": err_str}
+                        break
                     finally:
                         ctx.close()
                 except Exception as e2:
                     log(f"Retry failed for {host}: {e2}")
                     last_error = err_str  # keep original error
 
+    # Wait for background lookups (capped)
+    for t in bg:
+        t.join(timeout=15)
+
+    cert  = cert_result[0]
+    asn   = asn_result[0]
+    whois = whois_result[0]
+
+    extra = {
+        "ip":             ip,
+        "reverse_dns":    reverse_dns,
+        "nameservers":    nameservers,
+        "ssl_expiry":     cert["expiry"],
+        "cert_subject_cn": cert["subject_cn"],
+        "cert_san":       ", ".join(cert["san"][:10]),
+        "asn":            asn["asn"],
+        "asn_name":       asn["asn_name"],
+        "hosting_country": asn["country"],
+        "registrar":      whois["registrar"],
+        "domain_expiry":  whois["domain_expiry"],
+        "scan_time":      scan_time,
+    }
+
+    if scan_result:
+        scan_result.update(extra)
+        scan_result["scan_state"] = classify_error(
+            scan_result.get("error", ""), scan_result.get("status")
+        )
+        return scan_result
+
     return {
         "host": host, "status": "", "final_url": "", "title": "",
-        "load_time": "", "ssl_expiry": "", "screenshot": "", "thumbnail": "",
-        "security_headers": {"_score": 0}, "redirect_chain": [], "cms": "",
+        "load_time": "", "screenshot": "", "thumbnail": "",
+        "security_headers": {"_score": 0}, "redirect_chain": [],
+        "cms": "", "cdn": "",
         "error": last_error,
-        "ip": ip, "reverse_dns": reverse_dns, "nameservers": nameservers,
+        "scan_state": classify_error(last_error, ""),
+        **extra,
     }
 
 
@@ -426,28 +623,43 @@ def _sec_score(row: dict) -> int:
 
 def write_csv(data):
     fieldnames = [
-        "host", "ip", "reverse_dns", "nameservers", "status", "final_url",
-        "title", "load_time", "ssl_expiry", "cms", "sec_score",
-        "redirects", "redirect_chain", "delta", "error",
+        "host", "ip", "reverse_dns", "nameservers",
+        "asn", "asn_name", "hosting_country",
+        "scan_state", "status", "final_url", "title", "load_time",
+        "ssl_expiry", "cert_subject_cn", "cert_san",
+        "cms", "cdn", "sec_score",
+        "redirects", "redirect_chain",
+        "registrar", "domain_expiry",
+        "delta", "error", "scan_time",
     ]
     rows = []
     for r in data:
         rows.append({
-            "host":           r["host"],
-            "ip":             r.get("ip", ""),
-            "reverse_dns":    r.get("reverse_dns", ""),
-            "nameservers":    r.get("nameservers", ""),
-            "status":         r.get("status", ""),
-            "final_url":      r.get("final_url", ""),
-            "title":          r.get("title", ""),
-            "load_time":      r.get("load_time", ""),
-            "ssl_expiry":     r.get("ssl_expiry", ""),
-            "cms":            r.get("cms", ""),
-            "sec_score":      _sec_score(r),
-            "redirects":      len(r.get("redirect_chain", [])),
-            "redirect_chain": _redirect_chain_str(r.get("redirect_chain", [])),
-            "delta":          r.get("delta", ""),
-            "error":          r.get("error", ""),
+            "host":            r["host"],
+            "ip":              r.get("ip", ""),
+            "reverse_dns":     r.get("reverse_dns", ""),
+            "nameservers":     r.get("nameservers", ""),
+            "asn":             r.get("asn", ""),
+            "asn_name":        r.get("asn_name", ""),
+            "hosting_country": r.get("hosting_country", ""),
+            "scan_state":      r.get("scan_state", ""),
+            "status":          r.get("status", ""),
+            "final_url":       r.get("final_url", ""),
+            "title":           r.get("title", ""),
+            "load_time":       r.get("load_time", ""),
+            "ssl_expiry":      r.get("ssl_expiry", ""),
+            "cert_subject_cn": r.get("cert_subject_cn", ""),
+            "cert_san":        r.get("cert_san", ""),
+            "cms":             r.get("cms", ""),
+            "cdn":             r.get("cdn", ""),
+            "sec_score":       _sec_score(r),
+            "redirects":       len(r.get("redirect_chain", [])),
+            "redirect_chain":  _redirect_chain_str(r.get("redirect_chain", [])),
+            "registrar":       r.get("registrar", ""),
+            "domain_expiry":   r.get("domain_expiry", ""),
+            "delta":           r.get("delta", ""),
+            "error":           r.get("error", ""),
+            "scan_time":       r.get("scan_time", ""),
         })
     with open(OUTPUT_DIR / "report.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -638,13 +850,25 @@ def write_excel(data):
     # ═══════════════════════════════════════════════════════════════════════
     ws = wb.create_sheet(_t["sheet_inventory"])
 
-    # Col: Host Status Ladezeit SSL-bis CMS Sec Redirects FinalURL Titel Delta Fehler Preview
-    headers    = ["Host", "IP-Adresse", "Reverse DNS", "Nameserver",
-                  "Status", "Ladezeit (s)", "SSL gültig bis",
-                  "CMS", "Sec.", "Redirects", "Final URL", "Titel", "Delta", "Fehler", "Preview"]
-    col_widths = [28,     16,          22,            32,
-                  10,     14,           16,
-                  14,     8,       12,           40,         30,     10,     30,        28    ]
+    # Col: Host IP RevDNS NS ASN Provider Country ScanState Status Ladezeit SSL CertSubj CertSAN CMS CDN Sec Redir Registrar DomainExp FinalURL Titel Delta Fehler ScanTime Preview
+    headers    = [
+        "Host", "IP-Adresse", "Reverse DNS", "Nameserver",
+        "ASN", "Provider", "Land",
+        "Scan State", "Status", "Ladezeit (s)", "SSL gültig bis",
+        "Cert Subject", "Cert SAN",
+        "CMS", "CDN", "Sec.", "Redirects",
+        "Registrar", "Domain-Ablauf",
+        "Final URL", "Titel", "Delta", "Fehler", "Scan-Zeit", "Preview",
+    ]
+    col_widths = [
+        28, 16, 22, 32,
+        12, 24, 8,
+        14, 10, 14, 16,
+        24, 30,
+        14, 14, 8, 12,
+        24, 16,
+        40, 30, 10, 30, 20, 28,
+    ]
 
     for j, h in enumerate(headers, 1):
         c = ws.cell(row=1, column=j, value=h)
@@ -668,26 +892,36 @@ def write_excel(data):
 
         vals = [
             row["host"], row.get("ip", ""), row.get("reverse_dns", ""), row.get("nameservers", ""),
+            row.get("asn", ""), row.get("asn_name", ""), row.get("hosting_country", ""),
+            row.get("scan_state", ""),
             row.get("status", ""), row.get("load_time", ""), row.get("ssl_expiry", ""),
-            row.get("cms", "") or "—", sec_val, redir_val,
+            row.get("cert_subject_cn", ""), row.get("cert_san", ""),
+            row.get("cms", "") or "—", row.get("cdn", "") or "—",
+            sec_val, redir_val,
+            row.get("registrar", ""), row.get("domain_expiry", ""),
             row.get("final_url", ""), row.get("title", ""), delta_val,
-            row.get("error", ""), "",
+            row.get("error", ""), row.get("scan_time", ""), "",
         ]
+        # Column indices (1-based):
+        # 1=Host 2=IP 3=RevDNS 4=NS 5=ASN 6=Provider 7=Country
+        # 8=ScanState 9=Status 10=Ladezeit 11=SSL 12=CertSubj 13=CertSAN
+        # 14=CMS 15=CDN 16=Sec 17=Redir 18=Registrar 19=DomainExp
+        # 20=FinalURL 21=Titel 22=Delta 23=Fehler 24=ScanTime 25=Preview
 
         for j, val in enumerate(vals, 1):
             c = ws.cell(row=i, column=j, value=val)
             c.font, c.fill, c.border = cell_font, fill, border
-            # center: Status(5), Ladezeit(6), SSL(7), Sec(9), Redirects(10), Delta(13)
-            c.alignment = center_align if j in (5, 6, 7, 9, 10, 13) else cell_align
+            # center: ScanState(8), Status(9), Ladezeit(10), SSL(11), Sec(16), Redir(17), Delta(22), ScanTime(24)
+            c.alignment = center_align if j in (8, 9, 10, 11, 16, 17, 22, 24) else cell_align
 
-            if j == 5 and val:  # Status
+            if j == 9 and val:  # Status
                 s = int(val) if str(val).isdigit() else 0
                 c.font = font_ok if 200 <= s < 300 else (font_redir if 300 <= s < 400 else font_err)
-            elif j == 9:  # Sec score
+            elif j == 16:  # Sec score
                 score = _sec_score(row)
                 c.font = Font(name="Arial", size=10, bold=True,
                               color="198754" if score >= 6 else ("856404" if score >= 4 else SRG_RED))
-            elif j == 13 and val:  # Delta
+            elif j == 22 and val:  # Delta
                 col = _delta_colors.get(val, SRG_GRAY)
                 c.font = Font(name="Arial", size=10, bold=True, color=col)
 
@@ -701,8 +935,8 @@ def write_excel(data):
 
         ws.row_dimensions[i].height = 80
 
-    # Conditional formatting: Ladezeit (now column F, index 6)
-    lt_range = f"F2:F{len(data)+1}"
+    # Conditional formatting: Ladezeit (now column J, index 10)
+    lt_range = f"J2:J{len(data)+1}"
     ws.conditional_formatting.add(lt_range, CellIsRule(
         operator="greaterThan", formula=["3"],
         fill=PatternFill("solid", fgColor="fde8e8"),
@@ -774,6 +1008,16 @@ def write_html(data):
             "thumb":     b64,
             "error":     row.get("error", ""),
             "cms":       row.get("cms", ""),
+            "cdn":       row.get("cdn", ""),
+            "scan_state": row.get("scan_state", ""),
+            "cert_subject_cn": row.get("cert_subject_cn", ""),
+            "cert_san":  row.get("cert_san", ""),
+            "asn":       row.get("asn", ""),
+            "asn_name":  row.get("asn_name", ""),
+            "hosting_country": row.get("hosting_country", ""),
+            "registrar": row.get("registrar", ""),
+            "domain_expiry": row.get("domain_expiry", ""),
+            "scan_time": row.get("scan_time", ""),
             "sec_score": sh.get("_score", 0),
             "sec_detail": {k: bool(v) for k, v in sh.items() if k != "_score"},
             "redirect_count": len(chain),
@@ -849,6 +1093,8 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,
 .card-dns {{ margin-top:0.2rem; font-size:0.7rem; color:var(--srg-gray-light); line-height:1.5; }}
 .card-ip {{ cursor:default; }}
 .card-ns {{ }}
+.card-asn {{ }}
+.cell-asn {{ font-size:0.75rem; color:var(--srg-gray-light); }}
 .card-error {{ margin-top:0.4rem; padding:0.3rem 0.5rem; background:#fde8e8; border-radius:4px; font-size:0.72rem; color:var(--srg-red); }}
 .cell-ip {{ font-size:0.78rem; font-family:monospace; white-space:nowrap; }}
 .cell-ns {{ font-size:0.75rem; color:var(--srg-gray-light); }}
@@ -860,6 +1106,7 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,
 .badge-server-err {{ background:#fde8e8; color:#8b0000; }}
 .badge-unknown {{ background:#edf2f7; color:var(--srg-gray-light); }}
 .badge-cms {{ background:#e8f0fe; color:#1a56db; }}
+.badge-cdn {{ background:#e8f4fd; color:#0369a1; }}
 .badge-new {{ background:var(--srg-green-bg); color:var(--srg-green); }}
 .badge-changed {{ background:var(--srg-yellow-bg); color:var(--srg-yellow); }}
 .sec-score {{ display:inline-flex; align-items:center; gap:2px; font-size:0.72rem; font-weight:700; }}
@@ -961,7 +1208,7 @@ tbody td {{ padding:0.45rem 0.7rem; vertical-align:middle; border-bottom:1px sol
 <div class="pagination" id="pagination"></div>
 
 <div class="footer">
-    Web Inventory Reporter · {ts}<br>
+    Browser-basierter Check (Playwright/Chromium) · Web Inventory Reporter · {ts}<br>
     {_a['name']} · <a href="mailto:{_a['email']}">{_a['email']}</a>
 </div>
 
@@ -1022,7 +1269,7 @@ function applyFilters() {{
   if (cmsFilter !== 'all') d = d.filter(r => r.cms === cmsFilter);
   if (searchTerm) {{
     const q=searchTerm.toLowerCase();
-    d = d.filter(r => (r.host+' '+r.title+' '+r.final_url+' '+r.error+' '+r.cms).toLowerCase().includes(q));
+    d = d.filter(r => (r.host+' '+r.title+' '+r.final_url+' '+r.error+' '+r.cms+' '+r.cdn+' '+r.asn+' '+(r.asn_name||'')+' '+(r.scan_state||'')).toLowerCase().includes(q));
   }}
   if (sortCol !== null) {{
     d = [...d].sort((a,b) => {{
@@ -1061,20 +1308,22 @@ function render() {{
     const img   = r.thumb ? `<img src="${{r.thumb}}" alt="${{esc(r.host)}}" loading="lazy">` : '<div class="no-preview">Kein Preview</div>';
     const ssl   = r.ssl_expiry ? `<span class="card-ssl">🔒 ${{esc(r.ssl_expiry)}}</span>` : '';
     const cms   = r.cms ? `<span class="badge badge-cms">${{esc(r.cms)}}</span>` : '';
+    const cdn   = r.cdn ? `<span class="badge badge-cdn">${{esc(r.cdn)}}</span>` : '';
     const sec   = secHtml(r.sec_score, r.sec_detail);
     const redir = redirHtml(r.redirect_count, r.redirect_chain);
     const delta = deltaHtml(r.delta);
     const err    = r.error ? `<div class="card-error">${{esc(r.error.substring(0,120))}}</div>` : '';
     const urlPfx = r.redirect_count > 0 ? '→ ' : '';
-    const dnsBlock = (r.ip || r.nameservers) ? `<div class="card-dns">${{
+    const asnLine = r.asn ? `<br><span class="card-asn">🏢 ${{esc(r.asn)}}${{r.asn_name ? ' · ' + esc(r.asn_name) : ''}}${{r.hosting_country ? ' (' + esc(r.hosting_country) + ')' : ''}}</span>` : '';
+    const dnsBlock = (r.ip || r.nameservers || r.asn) ? `<div class="card-dns">${{
       r.ip ? `<span class="card-ip" title="${{esc(r.reverse_dns ? r.reverse_dns + ' (' + r.ip + ')' : r.ip)}}">🖥 ${{esc(r.ip)}}</span>` : ''
     }}${{
       r.nameservers ? (r.ip ? '<br>' : '') + `<span class="card-ns">🌐 ${{esc(r.nameservers)}}</span>` : ''
-    }}</div>` : '';
+    }}${{asnLine}}</div>` : '';
     return `<div class="card"><div class="card-image">${{img}}</div><div class="card-body">
       <h3 class="card-title">${{esc(r.host)}} ${{delta}}</h3>
       <div class="card-meta">${{badge(r.status)}} ${{ltHtml(r.load_time)}} ${{ssl}} ${{redir}}</div>
-      <div class="card-meta">${{cms}} ${{sec}}</div>
+      <div class="card-meta">${{cms}} ${{cdn}} ${{sec}}</div>
       <div class="card-pagetitle">${{esc((r.title||'—').substring(0,60))}}</div>
       <a class="card-url" href="${{esc(r.final_url)}}" target="_blank" rel="noopener">${{urlPfx}}${{esc((r.final_url||'—').substring(0,70))}}</a>
       ${{dnsBlock}}
@@ -1084,9 +1333,11 @@ function render() {{
   // ── Table ──
   const cols = [
     ['thumb','Preview',false],['host','Host',true],['status','Status',true],
+    ['scan_state','Scan State',true],
     ['load_time','Ladezeit',true],['ssl_expiry','SSL bis',true],['cms','CMS',true],
+    ['cdn','CDN',true],
     ['sec_score','Sec.',true],['redirect_count','Redir.',true],
-    ['ip','IP',true],['nameservers','Nameserver',true],
+    ['ip','IP',true],['asn','ASN',true],['nameservers','Nameserver',true],
     ['title','Titel',true],['final_url','URL',true],['delta','Delta',true],['error','Fehler',true]
   ];
   document.getElementById('table-head').innerHTML = cols.map(([key,label,sortable]) => {{
@@ -1104,12 +1355,15 @@ function render() {{
       <td>${{img}}</td>
       <td class="cell-host">${{esc(r.host)}}</td>
       <td class="cell-center">${{badge(r.status)}}</td>
+      <td class="cell-center"><code style="font-size:0.72rem">${{esc(r.scan_state||'—')}}</code></td>
       <td class="cell-center">${{ltHtml(r.load_time)}}</td>
       <td class="cell-center">${{esc(r.ssl_expiry||'—')}}</td>
       <td class="cell-center">${{r.cms?`<span class="badge badge-cms">${{esc(r.cms)}}</span>`:'—'}}</td>
+      <td class="cell-center">${{r.cdn?`<span class="badge badge-cdn">${{esc(r.cdn)}}</span>`:'—'}}</td>
       <td class="cell-center">${{secHtml(r.sec_score,r.sec_detail)}}</td>
       <td class="cell-center">${{r.redirect_count?`<span class="redir-chip" title="${{esc(chain)}}">${{r.redirect_count}}x</span>`:'—'}}</td>
       <td class="cell-ip" title="${{esc(r.reverse_dns||'')}}">${{esc(r.ip||'—')}}</td>
+      <td class="cell-asn" title="${{esc(r.asn_name||'')}}">${{esc(r.asn||'—')}}</td>
       <td class="cell-ns">${{esc((r.nameservers||'—').substring(0,50))}}</td>
       <td>${{esc((r.title||'—').substring(0,50))}}</td>
       <td class="cell-url"><a href="${{esc(r.final_url)}}" target="_blank">${{esc((r.final_url||'—').substring(0,55))}}</a></td>
@@ -1163,6 +1417,7 @@ def write_json_report(data: list):
         "meta": {
             "generated_at": ts,
             "tool":         "Web Inventory Reporter",
+            "scan_method":  "Browser-basierter Check (Playwright/Chromium)",
             "total_hosts":  total,
             "summary": {
                 "status_2xx":   ok,
@@ -1181,18 +1436,28 @@ def write_json_report(data: list):
     for d in data:
         sh = d.get("security_headers", {})
         report["hosts"].append({
-            "host":         d["host"],
-            "ip":           d.get("ip", ""),
-            "reverse_dns":  d.get("reverse_dns", ""),
-            "nameservers":  [ns.strip() for ns in d.get("nameservers", "").split(",") if ns.strip()],
-            "status":       d.get("status", ""),
-            "final_url":    d.get("final_url", ""),
-            "title":        d.get("title", ""),
-            "load_time_s":  d.get("load_time") or None,
-            "ssl_expiry":   d.get("ssl_expiry", ""),
-            "cms":          d.get("cms", ""),
-            "delta":        d.get("delta", ""),
-            "error":        d.get("error", ""),
+            "host":            d["host"],
+            "ip":              d.get("ip", ""),
+            "reverse_dns":     d.get("reverse_dns", ""),
+            "nameservers":     [ns.strip() for ns in d.get("nameservers", "").split(",") if ns.strip()],
+            "asn":             d.get("asn", ""),
+            "asn_name":        d.get("asn_name", ""),
+            "hosting_country": d.get("hosting_country", ""),
+            "scan_state":      d.get("scan_state", ""),
+            "scan_time":       d.get("scan_time", ""),
+            "status":          d.get("status", ""),
+            "final_url":       d.get("final_url", ""),
+            "title":           d.get("title", ""),
+            "load_time_s":     d.get("load_time") or None,
+            "ssl_expiry":      d.get("ssl_expiry", ""),
+            "cert_subject_cn": d.get("cert_subject_cn", ""),
+            "cert_san":        [s.strip() for s in d.get("cert_san", "").split(",") if s.strip()],
+            "cms":             d.get("cms", ""),
+            "cdn":             d.get("cdn", ""),
+            "registrar":       d.get("registrar", ""),
+            "domain_expiry":   d.get("domain_expiry", ""),
+            "delta":           d.get("delta", ""),
+            "error":           d.get("error", ""),
             "redirects": {
                 "count": len(d.get("redirect_chain", [])),
                 "chain": [
