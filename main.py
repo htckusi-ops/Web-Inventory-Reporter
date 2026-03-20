@@ -1057,6 +1057,7 @@ def write_html(data):
         })
 
     data_json = json.dumps(json_data, ensure_ascii=False).replace('</', '<\\/')
+    data_json = data_json.encode("utf-8", errors="replace").decode("utf-8")
 
     html = f"""<!DOCTYPE html>
 <html lang="de">
@@ -1495,8 +1496,8 @@ render();
 </script>
 </body></html>"""
 
-    with open(OUTPUT_DIR / "report.html", "w", encoding="utf-8") as f:
-        f.write(html)
+    with open(OUTPUT_DIR / "report.html", "wb") as f:
+        f.write(html.encode("utf-8", errors="replace"))
     log("HTML report written.")
 
 
