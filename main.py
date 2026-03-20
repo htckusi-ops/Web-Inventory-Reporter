@@ -1659,8 +1659,15 @@ def main(input_file):
 
     # Sanitize surrogate characters that some pages produce (broken encodings).
     # Python's UTF-8 codec refuses to write them — replace with U+FFFD (replacement char).
+    # Recursive so nested structures (security_headers dict, redirect_chain list) are covered too.
     def _clean(v):
-        return v.encode("utf-8", errors="replace").decode("utf-8") if isinstance(v, str) else v
+        if isinstance(v, str):
+            return v.encode("utf-8", errors="replace").decode("utf-8")
+        if isinstance(v, dict):
+            return {k: _clean(val) for k, val in v.items()}
+        if isinstance(v, list):
+            return [_clean(item) for item in v]
+        return v
     for r in results:
         for k in list(r.keys()):
             r[k] = _clean(r[k])
