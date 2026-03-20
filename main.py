@@ -843,11 +843,12 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,
 .card-title {{ font-size:0.95rem; font-weight:700; margin-bottom:0.25rem; }}
 .card-meta {{ display:flex; align-items:center; gap:0.4rem; margin-bottom:0.25rem; flex-wrap:wrap; }}
 .card-pagetitle {{ font-size:0.78rem; color:var(--srg-gray-light); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:0.15rem; }}
-.card-url {{ font-size:0.75rem; color:var(--srg-red); text-decoration:none; word-break:break-all; }}
+.card-url {{ font-size:0.75rem; color:var(--srg-red); text-decoration:none; word-break:break-all; display:block; margin-bottom:0.15rem; }}
 .card-url:hover {{ text-decoration:underline; }}
 .card-ssl {{ font-size:0.72rem; color:var(--srg-green); }}
-.card-ip {{ font-size:0.72rem; color:var(--srg-gray-light); margin-top:0.2rem; display:inline-block; cursor:default; }}
-.card-ns {{ font-size:0.7rem; color:var(--srg-gray-light); display:inline-block; }}
+.card-dns {{ margin-top:0.2rem; font-size:0.7rem; color:var(--srg-gray-light); line-height:1.5; }}
+.card-ip {{ cursor:default; }}
+.card-ns {{ }}
 .card-error {{ margin-top:0.4rem; padding:0.3rem 0.5rem; background:#fde8e8; border-radius:4px; font-size:0.72rem; color:var(--srg-red); }}
 .cell-ip {{ font-size:0.78rem; font-family:monospace; white-space:nowrap; }}
 .cell-ns {{ font-size:0.75rem; color:var(--srg-gray-light); }}
@@ -1063,16 +1064,20 @@ function render() {{
     const sec   = secHtml(r.sec_score, r.sec_detail);
     const redir = redirHtml(r.redirect_count, r.redirect_chain);
     const delta = deltaHtml(r.delta);
-    const err   = r.error ? `<div class="card-error">${{esc(r.error.substring(0,120))}}</div>` : '';
-    const ipHtml = r.ip ? `<span class="card-ip" title="${{esc(r.reverse_dns||r.ip)}}">🖥 ${{esc(r.ip)}}</span>` : '';
-    const nsHtml = r.nameservers ? `<span class="card-ns" title="Nameserver">🌐 ${{esc(r.nameservers)}}</span>` : '';
+    const err    = r.error ? `<div class="card-error">${{esc(r.error.substring(0,120))}}</div>` : '';
+    const urlPfx = r.redirect_count > 0 ? '→ ' : '';
+    const dnsBlock = (r.ip || r.nameservers) ? `<div class="card-dns">${{
+      r.ip ? `<span class="card-ip" title="${{esc(r.reverse_dns ? r.reverse_dns + ' (' + r.ip + ')' : r.ip)}}">🖥 ${{esc(r.ip)}}</span>` : ''
+    }}${{
+      r.nameservers ? (r.ip ? '<br>' : '') + `<span class="card-ns">🌐 ${{esc(r.nameservers)}}</span>` : ''
+    }}</div>` : '';
     return `<div class="card"><div class="card-image">${{img}}</div><div class="card-body">
       <h3 class="card-title">${{esc(r.host)}} ${{delta}}</h3>
       <div class="card-meta">${{badge(r.status)}} ${{ltHtml(r.load_time)}} ${{ssl}} ${{redir}}</div>
       <div class="card-meta">${{cms}} ${{sec}}</div>
       <div class="card-pagetitle">${{esc((r.title||'—').substring(0,60))}}</div>
-      <a class="card-url" href="${{esc(r.final_url)}}" target="_blank" rel="noopener">${{esc((r.final_url||'—').substring(0,70))}}</a>
-      ${{ipHtml}}${{nsHtml ? '<br>' + nsHtml : ''}}
+      <a class="card-url" href="${{esc(r.final_url)}}" target="_blank" rel="noopener">${{urlPfx}}${{esc((r.final_url||'—').substring(0,70))}}</a>
+      ${{dnsBlock}}
       ${{err}}</div></div>`;
   }}).join('');
 
@@ -1140,6 +1145,72 @@ render();
     with open(OUTPUT_DIR / "report.html", "w", encoding="utf-8") as f:
         f.write(html)
     log("HTML report written.")
+
+
+# ── JSON Report (AI-readable) ────────────────────────────────────────────────
+
+def write_json_report(data: list):
+    ts = datetime.now().isoformat()
+    total = len(data)
+    ok       = sum(1 for d in data if str(d.get("status", "")).startswith("2"))
+    redir    = sum(1 for d in data if str(d.get("status", "")).startswith("3"))
+    cli_err  = sum(1 for d in data if str(d.get("status", "")).startswith("4"))
+    srv_err  = sum(1 for d in data if str(d.get("status", "")).startswith("5"))
+    errors   = sum(1 for d in data if d.get("error"))
+    load_times = [float(d["load_time"]) for d in data if d.get("load_time")]
+
+    report = {
+        "meta": {
+            "generated_at": ts,
+            "tool":         "Web Inventory Reporter",
+            "total_hosts":  total,
+            "summary": {
+                "status_2xx":   ok,
+                "status_3xx":   redir,
+                "status_4xx":   cli_err,
+                "status_5xx":   srv_err,
+                "scan_errors":  errors,
+                "avg_load_s":   round(sum(load_times) / len(load_times), 2) if load_times else None,
+                "min_load_s":   round(min(load_times), 2) if load_times else None,
+                "max_load_s":   round(max(load_times), 2) if load_times else None,
+            },
+        },
+        "hosts": [],
+    }
+
+    for d in data:
+        sh = d.get("security_headers", {})
+        report["hosts"].append({
+            "host":         d["host"],
+            "ip":           d.get("ip", ""),
+            "reverse_dns":  d.get("reverse_dns", ""),
+            "nameservers":  [ns.strip() for ns in d.get("nameservers", "").split(",") if ns.strip()],
+            "status":       d.get("status", ""),
+            "final_url":    d.get("final_url", ""),
+            "title":        d.get("title", ""),
+            "load_time_s":  d.get("load_time") or None,
+            "ssl_expiry":   d.get("ssl_expiry", ""),
+            "cms":          d.get("cms", ""),
+            "delta":        d.get("delta", ""),
+            "error":        d.get("error", ""),
+            "redirects": {
+                "count": len(d.get("redirect_chain", [])),
+                "chain": [
+                    {"url": r["url"], "status": r["status"]}
+                    for r in d.get("redirect_chain", [])
+                ],
+            },
+            "security_headers": {
+                "score":   sh.get("_score", 0),
+                "max":     len(SEC_HEADERS),
+                "present": [h for h in SEC_HEADERS if sh.get(h)],
+                "missing": [h for h in SEC_HEADERS if not sh.get(h)],
+            },
+        })
+
+    with open(OUTPUT_DIR / "report.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2, default=str)
+    log("JSON report written.")
 
 
 # ── Parallel worker ───────────────────────────────────────────────────────────
@@ -1227,9 +1298,11 @@ def main(input_file):
     write_csv(results)
     write_excel(results)
     write_html(results)
+    write_json_report(results)
     print("  ✓ output/report.csv")
     print("  ✓ output/report.xlsx")
     print("  ✓ output/report.html")
+    print("  ✓ output/report.json")
     print("─" * 50)
     print("Fertig!")
 
