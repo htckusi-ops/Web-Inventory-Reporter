@@ -1,3 +1,4 @@
+![Banner](assets/banner.png)
 # Web Inventory Reporter
 
 Browser-basierter Website-Scanner (Playwright/Chromium) mit professionellen Reports in HTML, Excel, CSV und JSON.
