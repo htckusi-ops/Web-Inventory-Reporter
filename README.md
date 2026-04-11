@@ -152,5 +152,19 @@ Alle Felder als Rohdaten, keine Bilder, direkt in Excel/R/Python importierbar.
 ```
 
 ---
+## Lizenz
 
+Dieses Projekt steht unter der GNU General Public License Version 3 (GPL-3.0-only).
+Der vollständige Lizenztext befindet sich in der Datei [LICENSE](LICENSE).
+
+## Disclaimer
+
+Web Inventory Reporter wurde von Markus Gerber privat in der Freizeit und als unabhängiges Nebenprojekt entwickelt.
+
+Die Software ist kein im Auftrag erstelltes Firmenprodukt und wurde nicht als Bestandteil einer arbeitsvertraglich übertragenen Entwicklungsaufgabe erstellt.
+
+Web Inventory Reporter wird in einem beruflichen Umfeld zu Test-, Ausbildungs-, Evaluations- und Monitoring-Zwecken verwendet. Diese Nutzung ändert den privaten Ursprung des Projekts nicht.
+
+Rechte an diesem Repository und am enthaltenen Quellcode verbleiben beim Autor, soweit nicht ausdrücklich schriftlich etwas anderes vereinbart wurde.
+---
 [GitHub Repository](https://github.com/htckusi-ops/Web-Inventory-Reporter/tree/main)
